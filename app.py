@@ -282,7 +282,7 @@ def webhook():
         # Mensagem manual da Evelin
         if from_me and not was_by_api:
             cmd = texto.strip().upper()
-            if cmd == "RETOMAR":
+            if cmd in ["RETOMAR", "Retomar", "VOLTAR", "Voltar", "retomar", "voltar"]:
                 # Evelin reativa o bot digitando RETOMAR
                 if telefone in humano_ativo:
                     del humano_ativo[telefone]
