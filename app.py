@@ -12,20 +12,20 @@ from googleapiclient.discovery import build
 app = Flask(__name__)
 
 # ─── Configuração ───────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY      = os.environ.get("ANTHROPIC_API_KEY")
-UAZAPI_TOKEN           = os.environ.get("UAZAPI_TOKEN")
-UAZAPI_URL             = os.environ.get("UAZAPI_URL")          # ex: https://xxx.uazapi.com
+ANTHROPIC_API_KEY       = os.environ.get("ANTHROPIC_API_KEY")
+UAZAPI_TOKEN            = os.environ.get("UAZAPI_TOKEN")
+UAZAPI_URL              = os.environ.get("UAZAPI_URL")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-CALENDAR_ID            = "evelinbaiense@gmail.com"
-HUMAN_PAUSE_MINUTOS    = 30   # bot para por 30 min após Evelin responder manualmente
+CALENDAR_ID             = "evelinbaiense@gmail.com"
+HUMAN_PAUSE_MINUTOS     = 30
 
-# ─── Memória em tempo de execução ───────────────────────────────────────────
-conversas    = {}   # {telefone: [{"role": "user/assistant", "content": "..."}]}
-humano_ativo = {}   # {telefone: timestamp} - quando Evelin assumiu a conversa
+# ─── Memória ────────────────────────────────────────────────────────────────
+conversas    = {}
+humano_ativo = {}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ─── Prompt do sistema ──────────────────────────────────────────────────────
+# ─── Prompt ─────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Você é Evelin Abreu, corretora de imóveis do Praia Rasa de Búzios 2.
 Atenda como a própria Evelin no WhatsApp — humana, próxima, profissional sem ser rígida.
 
@@ -127,11 +127,11 @@ Quando o cliente confirmar um dia e horário específico para visita, responda c
 no final da sua resposta, em linha separada, exatamente este JSON (sem markdown, sem formatação):
 {"agendar": true, "nome": "NOME_DO_CLIENTE", "data": "DD/MM/YYYY", "hora": "HH:MM"}
 
-Exemplo de resposta completa:
+Exemplo:
 "Ótimo, [Nome]! Visita marcada para sábado às 10h. Te espero lá 😊"
 {"agendar": true, "nome": "João Silva", "data": "24/05/2026", "hora": "10:00"}
 
-Se o cliente não confirmar um horário específico ainda, use:
+Se o cliente não confirmar horário ainda:
 "As visitas são de domingo a domingo 😊 Qual é o melhor dia e horário pra você? Me confirma aqui que já deixo anotado!"
 """
 
@@ -149,12 +149,10 @@ def get_calendar_service():
 
 
 def criar_evento(nome_cliente, telefone, data_str, hora_str):
-    """Cria evento de visita no Google Calendar."""
     try:
         service = get_calendar_service()
         dt = datetime.strptime(f"{data_str} {hora_str}", "%d/%m/%Y %H:%M")
         dt_fim = dt + timedelta(hours=2)
-
         evento = {
             "summary": f"Visita Praia Rasa — {nome_cliente}",
             "description": f"Cliente: {nome_cliente}\nWhatsApp: {telefone}",
@@ -171,7 +169,6 @@ def criar_evento(nome_cliente, telefone, data_str, hora_str):
 
 
 def extrair_agendamento(texto):
-    """Extrai JSON de agendamento do texto do bot."""
     match = re.search(r'\{[^{}]*"agendar"[^{}]*\}', texto)
     if match:
         try:
@@ -182,7 +179,6 @@ def extrair_agendamento(texto):
 
 
 def limpar_json(texto):
-    """Remove o bloco JSON do texto antes de enviar ao cliente."""
     return re.sub(r'\{[^{}]*"agendar"[^{}]*\}', '', texto).strip()
 
 
@@ -196,8 +192,13 @@ def enviar_mensagem(telefone, texto):
     payload = {"number": telefone, "text": texto_limpo}
 
     try:
-        r = requests.post(f"{UAZAPI_URL}/message/sendText", json=payload, headers=headers, timeout=10)
-        print(f"[WHATSAPP] Enviado para {telefone} | status {r.status_code}")
+        r = requests.post(
+            f"{UAZAPI_URL}/message/sendText",
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        print(f"[WHATSAPP] Para {telefone} | status {r.status_code} | resposta: {r.text[:100]}")
     except Exception as e:
         print(f"[WHATSAPP ERRO] {e}")
 
@@ -208,8 +209,6 @@ def resposta_bot(telefone, mensagem_usuario):
         conversas[telefone] = []
 
     conversas[telefone].append({"role": "user", "content": mensagem_usuario})
-
-    # Mantém últimas 20 mensagens para não estourar tokens
     historico = conversas[telefone][-20:]
 
     resposta = client.messages.create(
@@ -228,59 +227,69 @@ def resposta_bot(telefone, mensagem_usuario):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json or {}
+    print(f"[WEBHOOK] Recebido: {json.dumps(data)[:300]}")
 
     try:
-        event = data.get("event", "")
-        if event not in ["messages.upsert", "message"]:
-            return jsonify({"status": "ignorado"}), 200
+        # UAZAPI envia EventType no nível raiz
+        event_type = data.get("EventType", data.get("event", ""))
+        msg        = data.get("message", data.get("data", {}).get("message", {}))
 
-        msg_data = data.get("data", {})
-        key      = msg_data.get("key", {})
-        remote   = key.get("remoteJid", "")
-        from_me  = key.get("fromMe", False)
+        # Suporte aos dois formatos possíveis do UAZAPI
+        chat_id      = msg.get("chatId") or msg.get("remoteJid") or data.get("data", {}).get("key", {}).get("remoteJid", "")
+        from_me      = msg.get("fromMe", data.get("data", {}).get("key", {}).get("fromMe", False))
+        was_by_api   = msg.get("wasSentByApi", False)
+        is_group     = msg.get("isGroup", "@g.us" in str(chat_id))
+        texto        = (
+            msg.get("text") or
+            msg.get("content") or
+            msg.get("conversation") or
+            msg.get("extendedTextMessage", {}).get("text") or
+            ""
+        ).strip()
+
+        telefone = str(chat_id).replace("@s.whatsapp.net", "").replace("@c.us", "").replace("@g.us", "")
+
+        print(f"[MSG] telefone={telefone} from_me={from_me} api={was_by_api} grupo={is_group} texto='{texto}'")
 
         # Ignora grupos
-        if "@g.us" in remote:
+        if is_group:
             return jsonify({"status": "grupo_ignorado"}), 200
 
-        telefone = remote.replace("@s.whatsapp.net", "").replace("@c.us", "")
+        # Ignora se não tiver telefone válido
+        if not telefone or len(telefone) < 8:
+            return jsonify({"status": "sem_telefone"}), 200
 
-        # Evelin respondeu manualmente → pausa o bot por 30 min
-        if from_me:
+        # Mensagem enviada pela Evelin manualmente (não pelo bot)
+        if from_me and not was_by_api:
             humano_ativo[telefone] = time.time()
-            print(f"[HUMANO] Evelin assumiu conversa com {telefone}")
+            print(f"[HUMANO] Evelin assumiu {telefone}")
             return jsonify({"status": "humano_ativo"}), 200
 
-        # Verifica se o humano ainda está no controle
+        # Ignora mensagens enviadas pelo próprio bot via API
+        if from_me and was_by_api:
+            return jsonify({"status": "bot_ignorado"}), 200
+
+        # Verifica pausa por humano
         if telefone in humano_ativo:
             decorrido = time.time() - humano_ativo[telefone]
             if decorrido < HUMAN_PAUSE_MINUTOS * 60:
-                print(f"[HUMANO] Bot pausado para {telefone} ({int(decorrido//60)}min)")
+                print(f"[HUMANO] Bot pausado para {telefone}")
                 return jsonify({"status": "humano_no_controle"}), 200
             else:
                 del humano_ativo[telefone]
 
-        # Extrai texto da mensagem
-        msg = msg_data.get("message", {})
-        texto = (
-            msg.get("conversation") or
-            msg.get("extendedTextMessage", {}).get("text") or
-            msg.get("imageMessage", {}).get("caption") or
-            ""
-        ).strip()
-
         if not texto:
             return jsonify({"status": "sem_texto"}), 200
 
-        # Nova conversa → envia saudação
+        # Nova conversa → saudação
         if telefone not in conversas:
             enviar_mensagem(telefone, SAUDACAO)
             conversas[telefone] = [{"role": "assistant", "content": SAUDACAO}]
 
-        # Obtém resposta do bot
+        # Resposta do bot
         resposta = resposta_bot(telefone, texto)
 
-        # Verifica se há agendamento confirmado
+        # Agenda se confirmado
         agendamento = extrair_agendamento(resposta)
         if agendamento and agendamento.get("agendar"):
             criar_evento(
@@ -290,11 +299,10 @@ def webhook():
                 hora_str=agendamento.get("hora", "")
             )
 
-        # Envia resposta ao cliente (sem o JSON)
         enviar_mensagem(telefone, resposta)
 
     except Exception as e:
-        print(f"[WEBHOOK ERRO] {e}")
+        print(f"[ERRO] {e}")
 
     return jsonify({"status": "ok"}), 200
 
