@@ -193,7 +193,7 @@ def enviar_mensagem(telefone, texto):
 
     try:
         r = requests.post(
-            f"{UAZAPI_URL}/message/sendText",
+            f"{UAZAPI_URL}/send/text",
             json=payload,
             headers=headers,
             timeout=15
