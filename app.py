@@ -17,7 +17,7 @@ UAZAPI_TOKEN            = os.environ.get("UAZAPI_TOKEN")
 UAZAPI_URL              = os.environ.get("UAZAPI_URL")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 CALENDAR_ID             = "evelinbaiense@gmail.com"
-HUMAN_PAUSE_MINUTOS     = 30
+HUMAN_PAUSE_MINUTOS     = 30 
 
 # ─── Memória ────────────────────────────────────────────────────────────────
 conversas    = {}
