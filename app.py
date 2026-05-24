@@ -2,6 +2,7 @@ import os
 import json
 import time
 import re
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import anthropic
@@ -11,308 +12,319 @@ from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-# ─── Configuração ───────────────────────────────────────────────────────────
+# ─── Configuração ────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY       = os.environ.get("ANTHROPIC_API_KEY")
 UAZAPI_TOKEN            = os.environ.get("UAZAPI_TOKEN")
 UAZAPI_URL              = os.environ.get("UAZAPI_URL")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 CALENDAR_ID             = "evelinbaiense@gmail.com"
 HUMAN_PAUSE_MINUTOS     = 30
+REATIVACAO_HORAS        = 3   # horas sem resposta para reativar
 
-# ─── Memória ────────────────────────────────────────────────────────────────
-conversas    = {}
-humano_ativo = {}
+# ─── Mídias ──────────────────────────────────────────────────────────────────
+FOTOS = [
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.56_itxlrx.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.57_wmlvhl.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.35_eioep1.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.57_1_mszdep.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.35_1_kidkrk.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.34_cxhs57.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779040450/Editedimage_1776197718307_ms669e.png",
+]
+VIDEO_1 = "https://res.cloudinary.com/dd6o3z4ma/video/upload/v1779039974/WhatsApp_Video_2026-05-17_at_13.15.06_zrc6fs.mp4"
+VIDEO_2 = "https://res.cloudinary.com/dd6o3z4ma/video/upload/v1779039973/WhatsApp_Video_2026-05-17_at_13.19.32_b5ptia.mp4"
+
+# ─── Memória ─────────────────────────────────────────────────────────────────
+conversas     = {}   # {telefone: [{"role": ..., "content": ...}]}
+humano_ativo  = {}   # {telefone: timestamp}
+ultima_msg    = {}   # {telefone: timestamp} para reativação
+midia_enviada = {}   # {telefone: bool}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ─── Prompt ─────────────────────────────────────────────────────────────────
+# ─── Prompt ──────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Você é Evelin Abreu, corretora de imóveis do Praia Rasa de Búzios 2.
-Atenda como a própria Evelin no WhatsApp — humana, próxima, profissional sem ser rígida.
+Atenda como a própria Evelin no WhatsApp — humana, próxima, animada com o empreendimento.
 
-IDIOMA:
-- Responda SEMPRE em português do Brasil, independentemente do idioma que o cliente usar.
+IDIOMA: Responda SEMPRE em português do Brasil, independente do idioma do cliente.
 
-REGRAS DE TOM E COMPORTAMENTO:
+TOM E COMPORTAMENTO:
 - Espelhe o cliente. Se ele for informal, relaxe. Se for formal, mantenha.
-- Respostas curtas. Máximo 2 frases por mensagem. Sem textão.
-- Uma pergunta por vez. NUNCA faça uma pergunta e peça o nome na mesma mensagem.
-- Sempre espere a resposta do cliente antes de continuar.
+- Respostas curtas. Máximo 2-3 frases. Nunca textão.
+- Uma pergunta por vez. NUNCA faça duas perguntas na mesma mensagem.
 - Nunca revele que é IA. Se perguntarem, diga que é a própria Evelin.
 - Não invente informações. Se não souber, convide para visitar.
-- Nunca mande mais de uma mensagem seguida sem resposta do cliente.
+- Seja entusiasmada com o empreendimento — é genuíno, você acredita nele.
 
 PEDIDO DE NOME:
-- Peça o nome naturalmente no meio da conversa, em mensagem separada e sozinha, sem nenhuma outra pergunta.
+- Peça em mensagem SEPARADA, sozinha, sem nenhuma outra pergunta.
 - Exemplo CORRETO: "Qual é o seu nome?" — só isso.
-- Exemplo ERRADO: "Você prefere 300m² ou 600m²? Ah, e qual é o seu nome?" — PROIBIDO.
+- Exemplo ERRADO: "300m² ou 600m²? E seu nome?" — PROIBIDO.
 
-FLUXO:
-1. Responder imediatamente o que o cliente perguntou
-2. Na saudação inicial, perguntar se já conhece o empreendimento:
-   - Se JÁ CONHECE: "Que ótimo! Me conta, você está buscando para morar, veraneio ou investimento?"
-   - Se NÃO CONHECE: apresentar brevemente e perguntar o que está buscando
-   - NUNCA repetir a pergunta "já conhece" — só na abertura
-3. Pedir o nome naturalmente no meio da conversa, em mensagem separada e sozinha
-4. Quando o interesse estiver claro, apresentar o empreendimento com base no perfil
-5. Usar o script do plantão UMA VEZ quando o interesse for evidente
-6. Conduzir para agendamento de visita
+FLUXO DA CONVERSA:
+1. Na PRIMEIRA mensagem: responda o que o cliente perguntou E faça a pergunta de interesse.
+   - Se ele não disse o interesse: "Você está buscando para morar, veraneio ou investimento?"
+   - Se ele já disse o interesse na primeira mensagem: pule essa pergunta e vá para o passo 2.
+2. Na SEGUNDA mensagem (após saber o interesse): ofereça as mídias IMEDIATAMENTE.
+   - Use: "Que legal! Posso te mandar uns vídeos e fotos do empreendimento pra você já ter uma ideia? 😊"
+   - Se o cliente não tiver dado interesse claro, ainda assim ofereça as mídias cedo: "Antes de eu te contar tudo, posso mandar uns vídeos e fotos? Fica mais fácil de visualizar 😊"
+3. Quando o cliente aceitar as mídias: inclua [ENVIAR_MIDIA] no final da resposta.
+4. Após as mídias: pergunte o nome naturalmente e continue qualificando.
+5. Use o script do plantão UMA VEZ quando o interesse for evidente.
+6. Conduza para o agendamento de visita.
 
-SCRIPT DO PLANTÃO — usar UMA VEZ quando interesse for evidente:
-"[Nome], deixa eu te contar uma coisa 😊 Trabalho por comissão e meu plantão é por escala — se você for lá sem agendar comigo, outro corretor te atende e eu perco uma possível venda e a oportunidade de te atender com tanta dedicação. Me avisa antes, atendo qualquer dia e horário, sem compromisso nenhum!"
+SCRIPT DO PLANTÃO — usar UMA VEZ:
+"[Nome], deixa eu te contar uma coisa 😊 Trabalho por comissão e meu plantão é por escala — se você for lá sem agendar comigo, outro corretor te atende e eu perco essa venda. Me avisa antes, atendo qualquer dia e horário, sem compromisso!"
 
-EMPREENDIMENTO — Praia Rasa de Búzios 2:
-
-LOCALIZAÇÃO:
-- Estrada dos Búzios (RJ-106), Bairro da Rasa, divisa Búzios/Cabo Frio
-- 800m da Praia Rasa | 3 minutos da praia | Geribá a 8km
-- Sempre diga "próximo a Búzios". Só mencione Cabo Frio se perguntarem sobre endereço ou documentação.
+INFORMAÇÕES DO EMPREENDIMENTO:
+Localização: Estrada dos Búzios (RJ-106), Bairro da Rasa — entre a Praia Rasa e Búzios.
+- 3 minutos da Praia Rasa | Geribá a 8km | Região de kitesurf
 - Maps: https://www.google.com/maps/@-22.7238716,-42.001362,493m
+- Após dar o link: "Você conseguiu ver? Fica entre a Praia Rasa e Búzios — localização bem estratégica 😊"
 
-INFRAESTRUTURA:
-- Fechado, murado, portão fechado
-- Guarita — segurança e monitoramento serão implantados com a associação de moradores
-- Meio-fio instalado, rede elétrica em andamento com posteamento já feito, água encanada em breve
-- Futura associação de moradores
-- Taxa de condomínio: 10% do salário mínimo (cobrada somente após entrega do empreendimento)
-- Playground, praça de lazer, área verde, bosque
-- Próximo a condomínios de alto padrão, região de kitesurf
-- Temos quadras com vista para o mar e quadras com vista para a serra
+Infraestrutura: fechado, murado, portão, posteamento elétrico feito, água em breve, playground, praça, bosque, área verde, futura associação de moradores, taxa 10% salário mínimo (só após entrega).
 
-LOTES E VALORES — nunca altere esses números:
-
-Lote 300m² (dimensões: 10x30 ou 7,5x40):
-- Parcelas: a partir de R$899/mês em até 156x com reajuste anual pelo IGPM
-- Entrada: R$7.000
-- Entrada parcelada em 3x sem juros (ato / 30 dias / 60 dias) OU em até 10x no cartão (juros do cartão)
-- Vista mar: a partir de R$1.199/mês em até 156x com reajuste anual pelo IGPM
-- À vista: a partir de R$90.000 — informar SOMENTE se o cliente perguntar
-
-Lote 600m²:
-- Parcelas: a partir de R$1.599/mês em até 156x com reajuste anual pelo IGPM
-- Entrada: R$14.000
-- Entrada parcelada em 3x sem juros (ato / 30 dias / 60 dias) OU em até 10x no cartão (juros do cartão)
-- Vista mar: a partir de R$1.999/mês em até 156x com reajuste anual pelo IGPM
-- À vista: a partir de R$160.000 — informar SOMENTE se o cliente perguntar
+LOTES E VALORES (nunca altere):
+300m² (10x30 ou 7,5x40): R$899/mês em até 156x, entrada R$7.000
+Vista mar 300m²: a partir de R$1.199/mês em até 156x
+600m²: R$1.599/mês em até 156x, entrada R$14.000
+Vista mar 600m²: a partir de R$1.999/mês em até 156x
+Todos com reajuste anual pelo IGPM.
+À vista 300m²: R$90.000 | À vista 600m²: R$160.000 (só se perguntarem)
 
 FINANCIAMENTO:
-- Direto pela incorporadora, sem banco, sem SPC/Serasa, sem aprovação bancária
-- Planos de 12 a 156 parcelas — os juros variam de acordo com o plano escolhido
-- Primeira parcela em até 45 dias após a compra
-- Pode construir com 3 parcelas pagas, mediante autorização da empresa
-- Entrada parcelada em 3x é sem juros. Entrada no cartão tem juros do próprio cartão.
+- Direto pela incorporadora, sem banco, sem SPC/Serasa
+- Planos de 12 a 156x, juros de acordo com o plano + IGPM anual
+- Entrada em 3x sem juros (ato/30/60 dias) ou 10x no cartão (juros do cartão)
+- Pode construir com 3 parcelas pagas, com autorização
+- Primeira parcela em até 45 dias
 
-DOCUMENTAÇÃO (RGI):
-"Tem RGI sim. A incorporadora está finalizando o processo na prefeitura. Após a liberação, quem estiver com o lote quitado terá direito à transferência para o seu nome — é opcional e fica por conta do comprador."
+DOCUMENTAÇÃO: RGI em processo na prefeitura. Após liberação, quem estiver quitado pode transferir — opcional, por conta do comprador.
 
-OBJEÇÕES COMUNS:
-"Tá longe" / "Achei longe":
-→ "Na verdade fica bem perto — 3 minutos da praia pela RJ-106. Você está em qual região?"
+OBJEÇÕES:
+"Tá longe": "Na verdade fica 3 minutos da praia pela RJ-106. Você está em qual região?"
+"Tá caro": "O parcelamento começa em R$899/mês direto com a incorporadora, sem banco e sem SPC. Prefere 300m² ou 600m²?"
+"Tem juros?": "Tem juros de acordo com o plano (12 a 156x) e reajuste anual do IGPM. A entrada em 3x é sem juros."
+"Mora perto?": "Você está na região de Búzios? Porque o empreendimento fica na Estrada dos Búzios — quase certinho que você passou na frente! 😊 Quer visitar essa semana?"
 
-"Tá caro":
-→ "Entendo. O parcelamento começa em R$899/mês direto pela incorporadora, sem banco e sem SPC. Você prefere ver os lotes de 300m² ou 600m²?"
+GATILHOS (usar naturalmente):
+- "Imagina escapar todo final de semana com a praia a 3 minutos, sem depender de hotel."
+- "Quem reserva agora ainda escolhe o lote. As unidades estão saindo."
+- "Não precisa decidir nada na hora — vem conhecer e vê se faz sentido."
 
-"Tem juros?":
-→ "O financiamento tem juros de acordo com o plano escolhido, de 12 a 156 parcelas, mais o reajuste anual do IGPM — que é o índice padrão do mercado imobiliário. A entrada parcelada em 3x é sem nenhum acréscimo."
-
-GATILHOS — usar naturalmente, nunca forçar:
-- "Imagina ter um lugar pra escapar todo final de semana, a praia a 3 minutos, sem depender de hotel."
-- "Quem reserva agora ainda consegue escolher o lote. As unidades estão saindo rápido."
-- "Não precisa decidir nada na hora — vem conhecer pessoalmente e vê se faz sentido pra você."
-
-URGÊNCIA — quando o cliente hesitar em visitar:
-→ "Já vendemos boa parte do empreendimento. Quem agenda logo ainda tem escolha de lote."
+REPETIÇÃO DE VALORES:
+Se o cliente perguntar o mesmo valor de novo, responda em UMA frase curta e já direcione para a visita.
+Exemplo: "É R$899/mês com entrada de R$7.000 😊 Você consegue vir conhecer pessoalmente?"
 
 AGENDAMENTO:
-Quando o cliente confirmar um dia e horário específico para visita, responda confirmando e inclua
-no final da sua resposta, em linha separada, exatamente este JSON (sem markdown, sem formatação):
-{"agendar": true, "nome": "NOME_DO_CLIENTE", "data": "DD/MM/YYYY", "hora": "HH:MM"}
-
-Exemplo:
-"Ótimo, [Nome]! Visita marcada para sábado às 10h. Te espero lá 😊"
-{"agendar": true, "nome": "João Silva", "data": "24/05/2026", "hora": "10:00"}
-
-Se o cliente não confirmar horário ainda:
-"As visitas são de domingo a domingo 😊 Qual é o melhor dia e horário pra você? Me confirma aqui que já deixo anotado!"
+- Quando o cliente disser "domingo que vem", "sábado", ou qualquer dia já citado, NÃO pergunte a data de novo.
+- Confirme o dia e pergunte só o horário se necessário.
+- Correto: "Domingo que vem está ótimo! Qual horário você prefere?"
+- PROIBIDO: "Que dia é domingo que vem? (DD/MM)"
+- "As visitas são de domingo a domingo 😊 Qual é o melhor dia e horário pra você?"
+Quando confirmar dia e hora, inclua no final: {"agendar": true, "nome": "NOME", "data": "DD/MM/YYYY", "hora": "HH:MM"}
 """
 
-SAUDACAO = "Olá, tudo bem? Eu sou Evelin Abreu, corretora de imóveis 😊 Você já conhece o Praia Rasa de Búzios 2?"
 
-
-# ─── Google Calendar ────────────────────────────────────────────────────────
+# ─── Google Calendar ─────────────────────────────────────────────────────────
 def get_calendar_service():
     credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON)
     credentials = service_account.Credentials.from_service_account_info(
-        credentials_info,
-        scopes=["https://www.googleapis.com/auth/calendar"]
+        credentials_info, scopes=["https://www.googleapis.com/auth/calendar"]
     )
     return build("calendar", "v3", credentials=credentials)
 
-
-def criar_evento(nome_cliente, telefone, data_str, hora_str):
+def criar_evento(nome, telefone, data_str, hora_str):
     try:
         service = get_calendar_service()
         dt = datetime.strptime(f"{data_str} {hora_str}", "%d/%m/%Y %H:%M")
-        dt_fim = dt + timedelta(hours=2)
         evento = {
-            "summary": f"Visita Praia Rasa — {nome_cliente}",
-            "description": f"Cliente: {nome_cliente}\nWhatsApp: {telefone}",
-            "location": "Estrada dos Búzios (RJ-106), Bairro da Rasa, Cabo Frio – RJ",
+            "summary": f"Visita Praia Rasa — {nome}",
+            "description": f"Cliente: {nome}\nWhatsApp: {telefone}",
+            "location": "Estrada dos Búzios (RJ-106), Bairro da Rasa",
             "start": {"dateTime": dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "America/Sao_Paulo"},
-            "end":   {"dateTime": dt_fim.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "America/Sao_Paulo"},
+            "end":   {"dateTime": (dt + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "America/Sao_Paulo"},
         }
         service.events().insert(calendarId=CALENDAR_ID, body=evento).execute()
-        print(f"[AGENDA] Evento criado: {nome_cliente} em {data_str} às {hora_str}")
-        return True
+        print(f"[AGENDA] {nome} em {data_str} às {hora_str}")
     except Exception as e:
         print(f"[AGENDA ERRO] {e}")
-        return False
 
 
-def extrair_agendamento(texto):
-    match = re.search(r'\{[^{}]*"agendar"[^{}]*\}', texto)
-    if match:
-        try:
-            return json.loads(match.group())
-        except Exception:
-            return None
-    return None
-
-
-def limpar_json(texto):
-    return re.sub(r'\{[^{}]*"agendar"[^{}]*\}', '', texto).strip()
-
-
-# ─── WhatsApp via UAZAPI ────────────────────────────────────────────────────
-def enviar_mensagem(telefone, texto):
-    texto_limpo = limpar_json(texto)
-    if not texto_limpo:
-        return
-
+# ─── UAZAPI — envio de mensagens ──────────────────────────────────────────────
+def _post(endpoint, payload):
     headers = {"Content-Type": "application/json", "token": UAZAPI_TOKEN}
-    payload = {"number": telefone, "text": texto_limpo}
-
     try:
-        r = requests.post(
-            f"{UAZAPI_URL}/send/text",
-            json=payload,
-            headers=headers,
-            timeout=15
-        )
-        print(f"[WHATSAPP] Para {telefone} | status {r.status_code} | resposta: {r.text[:100]}")
+        r = requests.post(f"{UAZAPI_URL}{endpoint}", json=payload, headers=headers, timeout=15)
+        print(f"[{endpoint}] {payload.get('number','?')} → {r.status_code}")
+        return r
     except Exception as e:
-        print(f"[WHATSAPP ERRO] {e}")
+        print(f"[ERRO {endpoint}] {e}")
+
+def enviar_texto(telefone, texto):
+    texto = re.sub(r'\{[^{}]*"agendar"[^{}]*\}', '', texto).strip()
+    if texto:
+        _post("/send/text", {"number": telefone, "text": texto})
+
+def enviar_imagem(telefone, url, caption=""):
+    _post("/send/image", {"number": telefone, "image": url, "caption": caption})
+
+def enviar_video(telefone, url, caption=""):
+    _post("/send/video", {"number": telefone, "video": url, "caption": caption})
+
+def enviar_midias(telefone):
+    if midia_enviada.get(telefone):
+        return
+    midia_enviada[telefone] = True
+    def _enviar():
+        enviar_texto(telefone, "Olha só os vídeos do empreendimento 👇")
+        time.sleep(1)
+        enviar_video(telefone, VIDEO_1)
+        time.sleep(3)
+        enviar_video(telefone, VIDEO_2)
+        time.sleep(3)
+        enviar_texto(telefone, "E aqui algumas fotos 📍")
+        for foto in FOTOS:
+            enviar_imagem(telefone, foto)
+            time.sleep(1)
+        time.sleep(2)
+        enviar_texto(telefone, "O que achou? Você mora aqui na região ou estava visitando? 😊")
+    threading.Thread(target=_enviar, daemon=True).start()
 
 
-# ─── Claude com memória ─────────────────────────────────────────────────────
-def resposta_bot(telefone, mensagem_usuario):
+# ─── Claude com memória ───────────────────────────────────────────────────────
+def resposta_bot(telefone, mensagem, novo=False):
     if telefone not in conversas:
         conversas[telefone] = []
 
-    conversas[telefone].append({"role": "user", "content": mensagem_usuario})
+    # Se for nova conversa, instrui Claude a incluir a saudação na resposta
+    system = SYSTEM_PROMPT
+    if novo:
+        system += "\n\nIMPORTANTE: Esta é a PRIMEIRA mensagem do cliente. Comece sua resposta com a saudação: 'Olá, tudo bem? Eu sou Evelin Abreu, corretora de imóveis 😊' e em seguida responda naturalmente o que ele perguntou ou pediu."
+
+    conversas[telefone].append({"role": "user", "content": mensagem})
     historico = conversas[telefone][-20:]
 
     resposta = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=500,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=historico
     )
-
     texto = resposta.content[0].text
     conversas[telefone].append({"role": "assistant", "content": texto})
     return texto
 
 
-# ─── Webhook principal ──────────────────────────────────────────────────────
+# ─── Reativação ───────────────────────────────────────────────────────────────
+MSGS_REATIVACAO = [
+    "Oi! 😊 Ainda temos algumas unidades disponíveis no Praia Rasa de Búzios 2. Posso te ajudar com mais alguma informação?",
+    "Oi! Que tal dar uma passadinha para conhecer pessoalmente? As visitas são de domingo a domingo, qualquer horário 😊",
+    "Oi! Os lotes estão saindo — quem agenda logo ainda tem escolha. Quer marcar uma visita rápida? 😊",
+]
+reativacao_indice = {}
+
+def verificar_reativacao():
+    while True:
+        time.sleep(1800)  # verifica a cada 30 min
+        agora = time.time()
+        for tel, ts in list(ultima_msg.items()):
+            if tel in humano_ativo:
+                continue
+            if (agora - ts) >= REATIVACAO_HORAS * 3600:
+                idx = reativacao_indice.get(tel, 0)
+                if idx < len(MSGS_REATIVACAO):
+                    enviar_texto(tel, MSGS_REATIVACAO[idx])
+                    reativacao_indice[tel] = idx + 1
+                    ultima_msg[tel] = agora  # reseta o timer
+
+threading.Thread(target=verificar_reativacao, daemon=True).start()
+
+
+# ─── Webhook ──────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json or {}
-    print(f"[WEBHOOK] Recebido: {json.dumps(data)[:300]}")
+    print(f"[WEBHOOK] {json.dumps(data)[:200]}")
 
     try:
-        # UAZAPI envia EventType no nível raiz
-        event_type = data.get("EventType", data.get("event", ""))
         msg      = data.get("message", data)
         chat_obj = data.get("chat", {})
 
-        print(f"[KEYS] raiz={list(data.keys())[:15]}")
-        print(f"[CHAT_OBJ] keys={list(chat_obj.keys())[:10]}")
+        chat_id          = msg.get("chatId") or msg.get("sender") or msg.get("sender_pn") or data.get("chatId") or data.get("sender") or ""
+        from_me          = data.get("fromMe", msg.get("fromMe", False))
+        was_by_api       = data.get("wasSentByApi", msg.get("wasSentByApi", False))
+        is_group         = data.get("isGroup", msg.get("isGroup", "@g.us" in str(chat_id)))
+        chatbot_disabled = int(chat_obj.get("chatbot_disabled", 0))
+        texto            = (data.get("text") or msg.get("text") or data.get("content") or msg.get("content") or msg.get("conversation") or "").strip()
 
-        # chatId está dentro do objeto "message"
-        chat_id = (
-            msg.get("chatId") or
-            msg.get("sender") or
-            msg.get("sender_pn") or
-            data.get("chatId") or
-            data.get("sender") or
-            data.get("data", {}).get("key", {}).get("remoteJid", "")
-        )
-        from_me    = data.get("fromMe", chat_obj.get("fromMe", msg.get("fromMe", False)))
-        was_by_api = data.get("wasSentByApi", msg.get("wasSentByApi", False))
-        is_group   = data.get("isGroup", chat_obj.get("isGroup", msg.get("isGroup", "@g.us" in str(chat_id))))
-        texto      = (
-            data.get("text") or
-            msg.get("text") or
-            data.get("content") or
-            msg.get("content") or
-            msg.get("conversation") or
-            msg.get("extendedTextMessage", {}).get("text") or
-            ""
-        ).strip()
+        telefone = str(chat_id).replace("@s.whatsapp.net","").replace("@c.us","").replace("@g.us","")
 
-        telefone = str(chat_id).replace("@s.whatsapp.net", "").replace("@c.us", "").replace("@g.us", "")
+        print(f"[MSG] tel={telefone} from_me={from_me} api={was_by_api} grupo={is_group} chatbot_disabled={chatbot_disabled} texto='{texto}'")
 
-        print(f"[MSG] telefone={telefone} from_me={from_me} api={was_by_api} grupo={is_group} texto='{texto}'")
-
-        # Ignora grupos
         if is_group:
-            return jsonify({"status": "grupo_ignorado"}), 200
-
-        # Ignora se não tiver telefone válido
+            return jsonify({"status": "grupo"}), 200
         if not telefone or len(telefone) < 8:
-            return jsonify({"status": "sem_telefone"}), 200
+            return jsonify({"status": "sem_tel"}), 200
 
-        # Mensagem enviada pela Evelin manualmente (não pelo bot)
-        if from_me and not was_by_api:
+        # UAZAPI desativou o chatbot para esse chat (Evelin assumiu pelo Multiatendimento)
+        if chatbot_disabled:
             humano_ativo[telefone] = time.time()
-            print(f"[HUMANO] Evelin assumiu {telefone}")
-            return jsonify({"status": "humano_ativo"}), 200
+            print(f"[HUMANO] chatbot_disabled=1 para {telefone}")
+            return jsonify({"status": "chatbot_disabled"}), 200
 
-        # Ignora mensagens enviadas pelo próprio bot via API
+        # Mensagem manual da Evelin
+        if from_me and not was_by_api:
+            cmd = texto.strip().upper()
+            if cmd == "RETOMAR":
+                # Evelin reativa o bot digitando RETOMAR
+                if telefone in humano_ativo:
+                    del humano_ativo[telefone]
+                print(f"[RETOMAR] Bot reativado para {telefone}")
+            else:
+                # Qualquer outra mensagem manual pausa o bot
+                humano_ativo[telefone] = time.time()
+                print(f"[HUMANO] Evelin assumiu {telefone}")
+            return jsonify({"status": "humano"}), 200
+
+        # Mensagem do bot → ignora
         if from_me and was_by_api:
             return jsonify({"status": "bot_ignorado"}), 200
 
-        # Verifica pausa por humano
+        # Verifica pausa por humano — sem expiração, só volta com RETOMAR
         if telefone in humano_ativo:
-            decorrido = time.time() - humano_ativo[telefone]
-            if decorrido < HUMAN_PAUSE_MINUTOS * 60:
-                print(f"[HUMANO] Bot pausado para {telefone}")
-                return jsonify({"status": "humano_no_controle"}), 200
-            else:
-                del humano_ativo[telefone]
+            return jsonify({"status": "pausado"}), 200
 
         if not texto:
             return jsonify({"status": "sem_texto"}), 200
 
-        # Nova conversa → saudação
-        if telefone not in conversas:
-            enviar_mensagem(telefone, SAUDACAO)
-            conversas[telefone] = [{"role": "assistant", "content": SAUDACAO}]
+        # Atualiza timestamp para reativação
+        ultima_msg[telefone] = time.time()
+        if telefone in reativacao_indice:
+            reativacao_indice[telefone] = 0  # reseta ao responder
 
-        # Resposta do bot
-        resposta = resposta_bot(telefone, texto)
+        # Gera resposta
+        novo = telefone not in conversas
+        resposta = resposta_bot(telefone, texto, novo=novo)
 
-        # Agenda se confirmado
-        agendamento = extrair_agendamento(resposta)
-        if agendamento and agendamento.get("agendar"):
-            criar_evento(
-                nome_cliente=agendamento.get("nome", "Cliente"),
-                telefone=telefone,
-                data_str=agendamento.get("data", ""),
-                hora_str=agendamento.get("hora", "")
-            )
+        # Verifica se deve enviar mídias
+        if "[ENVIAR_MIDIA]" in resposta:
+            resposta = resposta.replace("[ENVIAR_MIDIA]", "").strip()
+            enviar_texto(telefone, resposta)
+            time.sleep(1)
+            enviar_midias(telefone)
+        else:
+            enviar_texto(telefone, resposta)
 
-        enviar_mensagem(telefone, resposta)
+        # Verifica agendamento
+        match = re.search(r'\{[^{}]*"agendar"[^{}]*\}', resposta)
+        if match:
+            try:
+                ag = json.loads(match.group())
+                if ag.get("agendar"):
+                    criar_evento(ag.get("nome","Cliente"), telefone, ag.get("data",""), ag.get("hora",""))
+            except:
+                pass
 
     except Exception as e:
         print(f"[ERRO] {e}")
