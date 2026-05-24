@@ -167,10 +167,16 @@ def enviar_texto(telefone, texto):
         _post("/send/text", {"number": telefone, "text": texto})
 
 def enviar_imagem(telefone, url, caption=""):
-    _post("/send/image", {"number": telefone, "image": url, "caption": caption})
+    payload = {"number": telefone, "type": "image", "file": url}
+    if caption:
+        payload["caption"] = caption
+    _post("/send/media", payload)
 
 def enviar_video(telefone, url, caption=""):
-    _post("/send/video", {"number": telefone, "video": url, "caption": caption})
+    payload = {"number": telefone, "type": "video", "file": url}
+    if caption:
+        payload["caption"] = caption
+    _post("/send/media", payload)
 
 def enviar_midias(telefone):
     if midia_enviada.get(telefone):
@@ -258,7 +264,7 @@ def webhook():
         chatbot_disabled = int(chat_obj.get("chatbot_disabled", 0))
         texto            = (data.get("text") or msg.get("text") or data.get("content") or msg.get("content") or msg.get("conversation") or "").strip()
 
-        telefone = str(chat_id).replace("@s.whatsapp.net","").replace("@c.us","").replace("@g.us","")
+        telefone = str(chat_id).replace("@s.whatsapp.net","").replace("@c.us","").replace("@g.us","").replace("@lid","")
 
         print(f"[MSG] tel={telefone} from_me={from_me} api={was_by_api} grupo={is_group} chatbot_disabled={chatbot_disabled} texto='{texto}'")
 
