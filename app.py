@@ -238,17 +238,13 @@ def webhook():
         print(f"[KEYS] raiz={list(data.keys())[:15]}")
         print(f"[CHAT_OBJ] keys={list(chat_obj.keys())[:10]}")
 
-        # chatId pode estar na raiz, em chat{} ou em message{}
+        # chatId está dentro do objeto "message"
         chat_id = (
+            msg.get("chatId") or
+            msg.get("sender") or
+            msg.get("sender_pn") or
             data.get("chatId") or
             data.get("sender") or
-            data.get("sender_pn") or
-            chat_obj.get("chatId") or
-            chat_obj.get("id") or
-            chat_obj.get("sender") or
-            chat_obj.get("phone") or
-            msg.get("chatId") or
-            msg.get("remoteJid") or
             data.get("data", {}).get("key", {}).get("remoteJid", "")
         )
         from_me    = data.get("fromMe", chat_obj.get("fromMe", msg.get("fromMe", False)))
