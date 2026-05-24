@@ -56,6 +56,12 @@ TOM E COMPORTAMENTO:
 - Não invente informações. Se não souber, convide para visitar.
 - Seja entusiasmada com o empreendimento — é genuíno, você acredita nele.
 
+ERROS DE DIGITAÇÃO E INTERPRETAÇÃO:
+- O cliente pode escrever errado, com gírias, abreviações ou frases incompletas. NUNCA comente o erro.
+- Interprete sempre pela intenção mais provável. Exemplos: 'ou' = 'oi', 'valer' = 'valor', 'preco' = 'preço', 'qnt' = 'quanto', 'td' = 'tudo', 'blz' = 'beleza'.
+- Se não entender, faça UMA pergunta curta e simpática para esclarecer, sem mencionar o erro.
+- NUNCA diga 'sua mensagem saiu incompleta' ou qualquer variação. Isso é rude e constrangedor.
+
 PEDIDO DE NOME:
 - Peça em mensagem SEPARADA, sozinha, sem nenhuma outra pergunta.
 - Exemplo CORRETO: "Qual é o seu nome?" — só isso.
@@ -257,7 +263,13 @@ def webhook():
         msg      = data.get("message", data)
         chat_obj = data.get("chat", {})
 
-        chat_id          = msg.get("chatId") or msg.get("sender") or msg.get("sender_pn") or data.get("chatId") or data.get("sender") or ""
+        raw_id = msg.get("chatId") or data.get("chatId") or ""
+        # Se for @lid (dispositivo vinculado), usa sender_pn que tem o número real
+        if "@lid" in str(raw_id) or not raw_id:
+            chat_id = msg.get("sender_pn") or msg.get("sender") or data.get("sender_pn") or data.get("sender") or raw_id
+        else:
+            chat_id = raw_id
+
         from_me          = data.get("fromMe", msg.get("fromMe", False))
         was_by_api       = data.get("wasSentByApi", msg.get("wasSentByApi", False))
         is_group         = data.get("isGroup", msg.get("isGroup", "@g.us" in str(chat_id)))
