@@ -2,7 +2,7 @@ import os
 import json
 import time
 import re
-from datetime import datetime, timedelta 
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import anthropic
 import requests
@@ -17,7 +17,7 @@ UAZAPI_TOKEN            = os.environ.get("UAZAPI_TOKEN")
 UAZAPI_URL              = os.environ.get("UAZAPI_URL")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 CALENDAR_ID             = "evelinbaiense@gmail.com"
-HUMAN_PAUSE_MINUTOS     = 30 
+HUMAN_PAUSE_MINUTOS     = 30
 
 # ─── Memória ────────────────────────────────────────────────────────────────
 conversas    = {}
@@ -232,15 +232,32 @@ def webhook():
     try:
         # UAZAPI envia EventType no nível raiz
         event_type = data.get("EventType", data.get("event", ""))
-        msg        = data.get("message", data.get("data", {}).get("message", {}))
+        msg      = data.get("message", data)
+        chat_obj = data.get("chat", {})
 
-        # Suporte aos dois formatos possíveis do UAZAPI
-        chat_id      = msg.get("chatId") or msg.get("remoteJid") or data.get("data", {}).get("key", {}).get("remoteJid", "")
-        from_me      = msg.get("fromMe", data.get("data", {}).get("key", {}).get("fromMe", False))
-        was_by_api   = msg.get("wasSentByApi", False)
-        is_group     = msg.get("isGroup", "@g.us" in str(chat_id))
-        texto        = (
+        print(f"[KEYS] raiz={list(data.keys())[:15]}")
+        print(f"[CHAT_OBJ] keys={list(chat_obj.keys())[:10]}")
+
+        # chatId pode estar na raiz, em chat{} ou em message{}
+        chat_id = (
+            data.get("chatId") or
+            data.get("sender") or
+            data.get("sender_pn") or
+            chat_obj.get("chatId") or
+            chat_obj.get("id") or
+            chat_obj.get("sender") or
+            chat_obj.get("phone") or
+            msg.get("chatId") or
+            msg.get("remoteJid") or
+            data.get("data", {}).get("key", {}).get("remoteJid", "")
+        )
+        from_me    = data.get("fromMe", chat_obj.get("fromMe", msg.get("fromMe", False)))
+        was_by_api = data.get("wasSentByApi", msg.get("wasSentByApi", False))
+        is_group   = data.get("isGroup", chat_obj.get("isGroup", msg.get("isGroup", "@g.us" in str(chat_id))))
+        texto      = (
+            data.get("text") or
             msg.get("text") or
+            data.get("content") or
             msg.get("content") or
             msg.get("conversation") or
             msg.get("extendedTextMessage", {}).get("text") or
