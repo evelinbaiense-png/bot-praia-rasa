@@ -26,6 +26,16 @@ ALERT_NUMBERS     = ['5522999004419', '5522995511909']
 RESUME_KEYWORD = '*'                                              # palavra/símbolo p/ reativar o bot
 PAUSE_TTL = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600   # tempo de segurança (12h padrão)
 
+# ─── FOLLOW-UP AUTOMÁTICO (REENGAJAMENTO) ────────────────────────────────────
+# Quando o cliente para de responder, o bot cutuca de novo em 3 estágios.
+FOLLOWUP_ENABLED    = os.environ.get('FOLLOWUP_ENABLED', 'true').lower() == 'true'
+FOLLOWUP_STAGE1_MIN = int(os.environ.get('FOLLOWUP_STAGE1_MIN', '10'))    # 1º toque: poucos minutos
+FOLLOWUP_STAGE2_MIN = int(os.environ.get('FOLLOWUP_STAGE2_MIN', '60'))    # 2º toque: ~1 hora
+FOLLOWUP_STAGE3_MIN = int(os.environ.get('FOLLOWUP_STAGE3_MIN', '360'))   # 3º toque: ~6h (e só à noite)
+FOLLOWUP_DAY_START  = int(os.environ.get('FOLLOWUP_DAY_START', '8'))      # não cutuca antes das 8h
+FOLLOWUP_DAY_END    = int(os.environ.get('FOLLOWUP_DAY_END', '21'))       # nem depois das 21h
+FOLLOWUP_CHECK_MIN  = int(os.environ.get('FOLLOWUP_CHECK_MIN', '5'))      # verifica a cada 5 min
+
 # ─── REDIS (MEMÓRIA PERSISTENTE) ─────────────────────────────────────────────
 import redis as _redis_lib
 
@@ -115,6 +125,27 @@ def clear_pause(phone):
     except Exception as e:
         print(f"Redis clear_pause error ({phone}): {e}")
 
+# ── Estado do follow-up por conversa ─────────────────────────────────────────
+def get_followup_state(phone):
+    r = get_redis()
+    if not r:
+        return None
+    try:
+        data = r.get(f"fu:{phone}")
+        return json.loads(data) if data else None
+    except Exception as e:
+        print(f"Redis fu get error ({phone}): {e}")
+        return None
+
+def set_followup_state(phone, state):
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.setex(f"fu:{phone}", CONV_TTL, json.dumps(state))
+    except Exception as e:
+        print(f"Redis fu set error ({phone}): {e}")
+
 # ─── MÍDIAS ──────────────────────────────────────────────────────────────────
 
 PHOTOS = [
@@ -149,6 +180,9 @@ COMO CONVERSAR (o mais importante)
 - Termine TODA mensagem com um próximo passo fácil de responder: uma pergunta objetiva ou uma escolha simples
   ("sábado ou domingo?", "300m² ou 600m²?", "quer que eu te mande as fotos?"). O cliente nunca pode ficar sem saber o que responder.
 - Uma pergunta por vez. Nunca empilhe perguntas.
+- As perguntas devem ser CURTAS e DIRETAS. Ex.: "Você pensa em morar, veraneio ou investir?" — nada de enrolar com "Me conta, você tá pensando em construir pra...".
+- VARIE o jeito de falar. NÃO repita a mesma muleta em mensagens seguidas (ex.: começar tudo com "Me conta"). Soa robótico.
+- Nada de perguntas vagas (ex.: "só deu uma olhada no anúncio?"). Vá direto ao ponto, com simpatia.
 - O TAMANHO da resposta depende do assunto:
    • Conversa normal: 1 a 3 frases, leves e diretas.
    • Valores, formas de pagamento, RGI ou infraestrutura: use quantas linhas precisar, bem organizado e fácil de ler.
@@ -166,7 +200,7 @@ QUALIFICAR O CLIENTE (naturalmente, sem interrogatório)
 ═══════════════════════════════════════════
 Ao longo da conversa, descubra — uma coisa de cada vez, encaixada com naturalidade:
 1. O objetivo: morar, veraneio ou investimento.
-2. Se é da região (Búzios/Cabo Frio) ou estava de passagem. Se for de fora, quando pretende vir.
+2. Se o cliente está NA região agora. Sinais como "tô viajando aqui", "estou aqui", "de passagem", "vim passear" significam que ele PODE estar na região neste momento — então APROVEITE pra puxar uma visita JÁ ("Que ótimo que você tá por aqui! Quer aproveitar e dar uma passadinha pra conhecer pessoalmente hoje ou amanhã?"). NÃO assuma que ele está longe nem pergunte "quando você volta?". Só pergunte "quando você vem?" se ele deixar claro que está em outra cidade/estado.
 3. Se tem preferência por lote de 300m² ou 600m².
 Use cada resposta para conduzir. Ex.: se disse "investimento", fale da valorização e da procura da região;
 se disse "veraneio", fale do sonho da casa de praia a 3 minutos do mar.
@@ -174,10 +208,10 @@ se disse "veraneio", fale do sonho da casa de praia a 3 minutos do mar.
 ═══════════════════════════════════════════
 ROTEIRO (use como guia, adapte ao cliente — não force etapa)
 ═══════════════════════════════════════════
-1. Entenda o objetivo dele (morar / veraneio / investir).
+1. Logo no começo, descubra o objetivo dele de forma curta e direta: "Você pensa em morar, ter uma casa de veraneio ou investir?". Sem rodeios e sem perguntas vagas.
 2. Ofereça as mídias: "Que ótimo! Tenho fotos e vídeos do empreendimento aqui — quer que eu te mande pra você ter uma ideia?"
 3. Depois das mídias, pergunte a reação e se ele é da região.
-4. Apresente os valores de forma PROATIVA (não espere ele perguntar): mostre a opção que faz sentido pra ele (300 ou 600m²), a entrada e a parcela.
+4. Apresente os valores de forma PROATIVA, mas NEUTRA: mostre os DOIS lotes (300m² e 600m²) com a entrada e a parcela de cada um, e deixe O CLIENTE escolher. NUNCA escolha por ele (não diga "o de 300 já dá pra você"). Termine perguntando qual faz mais sentido pra ele.
 5. Conduza para a visita com o aviso de plantão.
 
 ═══════════════════════════════════════════
@@ -462,6 +496,95 @@ def get_ai_response(phone, user_message):
     return reply_clean, alert_flag, media_flag
 
 
+# ─── FOLLOW-UP (REENGAJAMENTO QUANDO O CLIENTE SOME) ──────────────────────────
+
+def generate_followup(phone, stage):
+    """Gera uma mensagem de reengajamento conforme o estágio, usando o contexto da conversa."""
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        history = get_conversation(phone)
+        situ = {
+            1: "O cliente parou de responder há poucos minutos. Mande UMA mensagem curta e leve pra retomar de onde parou, sem cobrar. Termine com uma pergunta fácil de responder.",
+            2: "O cliente está sem responder há cerca de 1 hora. Mande uma mensagem calorosa com uma pergunta NOVA pra reengajar e puxar a visita ao empreendimento. Não repita o que já foi dito.",
+            3: "É o fim do dia e o cliente não voltou. Mande uma última mensagem do dia, simpática e sem pressão, reforçando o convite pra conhecer pessoalmente e deixando a porta aberta pra ele responder quando puder.",
+        }
+        system = SYSTEM_PROMPT + (
+            f"\n\n[VOCÊ ESTÁ RETOMANDO O CONTATO com um cliente que parou de responder. "
+            f"{situ.get(stage, situ[1])} Gere SÓ a mensagem, curta e natural. "
+            f"NÃO cumprimente de novo — a conversa já está em andamento.]"
+        )
+        last_20 = history[-20:]
+        api_messages = [
+            {"role": "user",      "content": "Olá"},
+            {"role": "assistant", "content": GREETING},
+        ] + last_20 + [
+            {"role": "user", "content": "[O cliente ficou em silêncio. Escreva agora a mensagem de retomada, seguindo a instrução.]"}
+        ]
+        response = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=300,
+            system=system,
+            messages=api_messages
+        )
+        msg = response.content[0].text
+        return msg.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
+    except Exception as e:
+        print(f"generate_followup error ({phone}): {e}")
+        return None
+
+
+def followup_sweep():
+    """Roda de tempos em tempos: cutuca clientes que pararam de responder, em 3 estágios."""
+    if not FOLLOWUP_ENABLED:
+        return
+    r = get_redis()
+    if not r:
+        return
+    try:
+        import pytz
+        hora = datetime.now(pytz.timezone("America/Sao_Paulo")).hour
+    except Exception:
+        hora = 12
+    # Não incomoda de madrugada
+    if not (FOLLOWUP_DAY_START <= hora < FOLLOWUP_DAY_END):
+        return
+    now = time.time()
+    try:
+        for key in r.scan_iter("fu:*"):
+            phone = key.split("fu:", 1)[1]
+            if is_paused(phone):
+                continue
+            state = get_followup_state(phone)
+            if not state:
+                continue
+            stage = state.get("stage", 0)
+            if stage >= 3:
+                continue
+            silent_min = (now - state.get("last_client_ts", now)) / 60.0
+            history = get_conversation(phone)
+            # Só cutuca se o último a falar foi o BOT (cliente realmente não respondeu)
+            if not history or history[-1].get("role") != "assistant":
+                continue
+            next_stage = None
+            if stage == 0 and silent_min >= FOLLOWUP_STAGE1_MIN:
+                next_stage = 1
+            elif stage == 1 and silent_min >= FOLLOWUP_STAGE2_MIN:
+                next_stage = 2
+            elif stage == 2 and silent_min >= FOLLOWUP_STAGE3_MIN and hora >= 18:
+                next_stage = 3   # 3º toque só à noite
+            if not next_stage:
+                continue
+            msg = generate_followup(phone, next_stage)
+            if msg:
+                if send_and_check(phone, msg):
+                    append_message(phone, "assistant", msg)
+                state["stage"] = next_stage
+                set_followup_state(phone, state)
+                print(f"📨 Follow-up estágio {next_stage} enviado para {phone}")
+    except Exception as e:
+        print(f"followup_sweep error: {e}")
+
+
 # ─── WEBHOOK ──────────────────────────────────────────────────────────────────
 
 @app.route('/webhook', methods=['POST'])
@@ -530,6 +653,9 @@ def webhook():
         # ───────────────────────────────────────────────────────────────────
         # 3) FLUXO NORMAL DO BOT
         # ───────────────────────────────────────────────────────────────────
+        # Cliente está ativo agora → zera o ciclo de follow-up
+        set_followup_state(phone, {"last_client_ts": time.time(), "stage": 0})
+
         text = ""
 
         # Áudio
@@ -699,6 +825,7 @@ if __name__ == '__main__':
     get_redis()  # conecta e loga o estado da memória logo no start
     scheduler = BackgroundScheduler()
     scheduler.add_job(send_recovery_message, 'interval', hours=RECOVERY_INTERVAL_HOURS)
+    scheduler.add_job(followup_sweep, 'interval', minutes=FOLLOWUP_CHECK_MIN)
     scheduler.start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
