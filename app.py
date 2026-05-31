@@ -213,8 +213,15 @@ Se perguntarem sobre prazo ou quantidade de parcelas: "O consultor apresenta as 
 AGENDAMENTO
 ═══════════════════════════════════════════
 Quando o cliente demonstrar interesse em visitar:
-"[Nome], as visitas são de terça a domingo. Que dia e horário funcionam melhor pra você? Só te peço uma coisa: me avisa antes de ir. Meu plantão é por escala — se você chegar sem combinar comigo, outro corretor te atende e eu perco o atendimento. É só confirmar aqui que eu te garanto."
-Quando a visita estiver confirmada (dia, horário e nome coletados): registre e não peça confirmação de novo.
+"[Nome], as visitas são de terça a domingo. Qual dia funciona melhor pra você? Prefere manhã ou tarde?"
+
+REGRAS DO AGENDAMENTO:
+- Se o cliente confirmar dia + período (manhã/tarde) → visita confirmada. Pare de perguntar.
+- Se o cliente confirmar só o dia (sem manhã/tarde) → também está confirmado. Não insista no período.
+- ⛔ NUNCA peça hora específica (14h, 15h, 16h, etc.). Manhã ou tarde é suficiente. NUNCA sugira uma hora ("Pode ser 15h?"). Se o cliente mencionar uma hora, aceite — mas você nunca pergunta nem sugere.
+- Quando confirmado: colete o nome completo do cliente e reforce o aviso de plantão:
+  "Só me avisa antes de ir. Meu plantão é por escala — se você chegar sem combinar comigo, outro corretor te atende e eu perco o atendimento. É só confirmar aqui que eu te garanto."
+- Quando a visita estiver confirmada (dia e nome coletados): não peça confirmação de novo.
 
 ═══════════════════════════════════════════
 DADOS DO EMPREENDIMENTO — PRAIA RASA DE BÚZIOS 2
@@ -496,6 +503,32 @@ FOLLOWUP_STOP_SIGNALS = [
     "terça às", "sábado às", "domingo às", "segunda às",
 ]
 
+def is_duplicate_msg(message):
+    """Evita resposta dupla quando o Webhook Global e o da instância disparam ao mesmo tempo."""
+    r = get_redis()
+    if not r:
+        return False
+    try:
+        # Tenta extrair o ID único da mensagem em vários formatos do uazapi
+        msg_id = (
+            message.get('id') or
+            message.get('messageId') or
+            (message.get('key') or {}).get('id', '') or
+            message.get('remoteJid', '') + str(message.get('timestamp', ''))
+        )
+        if not msg_id:
+            return False
+        key = f"dup:{msg_id}"
+        if r.exists(key):
+            print(f"🔁 Mensagem duplicada ignorada: {msg_id[:30]}")
+            return True
+        r.setex(key, 30, "1")  # TTL de 30 segundos
+        return False
+    except Exception as e:
+        print(f"Dedup error: {e}")
+        return False
+
+
 def is_visit_confirmed(history):
     """True se o histórico recente indica que a visita já foi agendada — para os follow-ups."""
     assistant_texts = " ".join(
@@ -504,6 +537,143 @@ def is_visit_confirmed(history):
         if m.get("role") == "assistant"
     )
     return any(s in assistant_texts for s in FOLLOWUP_STOP_SIGNALS)
+
+
+
+# ─── GOOGLE CALENDAR + LEMBRETE DE VISITA ────────────────────────────────────
+
+CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'evelinbaiense@gmail.com')
+
+def get_calendar_service():
+    """Retorna o serviço do Google Calendar usando as credenciais da service account."""
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        creds_json = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
+        if not creds_json:
+            return None
+        creds_data = json.loads(creds_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_data, scopes=['https://www.googleapis.com/auth/calendar']
+        )
+        return build('calendar', 'v3', credentials=credentials)
+    except Exception as e:
+        print(f"Calendar service error: {e}")
+        return None
+
+
+def next_weekday_date(day_name):
+    """Calcula a próxima data para um dia da semana em português."""
+    days_map = {
+        'segunda': 0, 'terça': 1, 'terca': 1, 'quarta': 2,
+        'quinta': 3, 'sexta': 4, 'sábado': 5, 'sabado': 5, 'domingo': 6
+    }
+    target = None
+    for name, num in days_map.items():
+        if name in day_name.lower():
+            target = num
+            break
+    if target is None:
+        return None
+    try:
+        import pytz
+        from datetime import timedelta
+        tz = pytz.timezone('America/Sao_Paulo')
+        today = datetime.now(tz).date()
+        days_ahead = target - today.weekday()
+        if days_ahead <= 0:
+            days_ahead += 7
+        return (today + timedelta(days=days_ahead)).isoformat()
+    except Exception:
+        return None
+
+
+def extract_and_save_visit(phone, history):
+    """Extrai detalhes da visita do histórico, salva no Redis e cria evento no Google Agenda."""
+    r = get_redis()
+    if not r:
+        return
+    if r.exists(f"visit:{phone}"):
+        return  # já salvo
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        recent_text = json.dumps(history[-12:], ensure_ascii=False)
+        response = client.messages.create(
+            model="claude-opus-4-8",
+            max_tokens=150,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Analise esta conversa e extraia os dados da visita agendada. "
+                    "Responda APENAS em JSON válido, sem texto adicional:\n"
+                    '{"name": "nome do cliente", "day": "dia da semana em português", '
+                    '"period": "manhã, tarde, ou desconhecido"}\n\n'
+                    f"Conversa:\n{recent_text}"
+                )
+            }]
+        )
+        data = json.loads(response.content[0].text.strip())
+        name = data.get('name', 'Cliente')
+        day = data.get('day', '')
+        period = data.get('period', 'desconhecido')
+        visit_date = next_weekday_date(day) if day else None
+        visit_info = {'name': name, 'phone': phone, 'day': day, 'period': period, 'date': visit_date}
+        r.setex(f"visit:{phone}", 30 * 24 * 3600, json.dumps(visit_info))
+        print(f"📅 Visita salva: {name} — {day} {period} ({visit_date})")
+        # Google Agenda
+        if visit_date:
+            service = get_calendar_service()
+            if service:
+                period_label = f" ({period})" if period != 'desconhecido' else ''
+                event = {
+                    'summary': f'Visita — {name}{period_label}',
+                    'location': 'Estrada dos Búzios (RJ-106), Bairro da Rasa',
+                    'description': f'WhatsApp: +{phone}\nPeríodo: {period}',
+                    'start': {'date': visit_date, 'timeZone': 'America/Sao_Paulo'},
+                    'end':   {'date': visit_date, 'timeZone': 'America/Sao_Paulo'},
+                }
+                service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+                print(f"📅 Google Calendar: evento criado para {name} em {visit_date}")
+    except Exception as e:
+        print(f"extract_and_save_visit error ({phone}): {e}")
+
+
+def visit_reminder_sweep():
+    """Roda diariamente às 8h: envia lembrete de visita de amanhã pro WhatsApp da Evelin."""
+    r = get_redis()
+    if not r:
+        return
+    try:
+        import pytz
+        from datetime import timedelta
+        tz = pytz.timezone('America/Sao_Paulo')
+        now = datetime.now(tz)
+        if now.hour != 8:
+            return
+        tomorrow = (now.date() + timedelta(days=1)).isoformat()
+        for key in r.scan_iter("visit:*"):
+            phone_num = key.split("visit:", 1)[1]
+            data_raw = r.get(key)
+            if not data_raw:
+                continue
+            visit = json.loads(data_raw)
+            if visit.get('date') == tomorrow:
+                name = visit.get('name', 'Cliente')
+                period = visit.get('period', '')
+                period_txt = f" — {period}" if period not in ('desconhecido', '') else ''
+                msg = (
+                    f"🗓️ *Visita amanhã!*\n\n"
+                    f"👤 {name}\n"
+                    f"📱 +{phone_num}\n"
+                    f"📅 {visit.get('day', '').capitalize()}{period_txt}\n"
+                    f"📍 Praia Rasa de Búzios 2\n\n"
+                    f"Confirme com o cliente antes de ir! 😊"
+                )
+                for alert_num in ALERT_NUMBERS:
+                    send_message(alert_num, msg)
+                print(f"🔔 Lembrete enviado: visita de {name} amanhã")
+    except Exception as e:
+        print(f"visit_reminder_sweep error: {e}")
 
 
 def followup_sweep():
@@ -540,6 +710,7 @@ def followup_sweep():
                 continue
             # Para se a visita já foi confirmada
             if is_visit_confirmed(history):
+                extract_and_save_visit(phone, history)
                 state["stage"] = 3  # encerra o ciclo
                 set_followup_state(phone, state)
                 continue
@@ -577,6 +748,10 @@ def webhook():
         message = data.get('message', {})
         if not message:
             return jsonify({'status': 'no_message'}), 200
+
+        # Proteção contra duplicatas (Webhook Global + instância disparando ao mesmo tempo)
+        if is_duplicate_msg(message):
+            return jsonify({'status': 'duplicate'}), 200
 
         if message.get('isGroup', False):
             return jsonify({'status': 'group'}), 200
@@ -826,6 +1001,7 @@ if __name__ == '__main__':
     scheduler = BackgroundScheduler()
     scheduler.add_job(send_recovery_message, 'interval', hours=RECOVERY_INTERVAL_HOURS)
     scheduler.add_job(followup_sweep, 'interval', minutes=FOLLOWUP_CHECK_MIN)
+    scheduler.add_job(visit_reminder_sweep, 'interval', minutes=30)  # verifica a cada 30min, age só às 8h
     scheduler.start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
