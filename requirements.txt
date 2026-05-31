@@ -1,7 +1,9 @@
-Flask
+flask
 anthropic
 requests
 APScheduler
 redis
 pytz
 openai
+google-api-python-client
+google-auth
