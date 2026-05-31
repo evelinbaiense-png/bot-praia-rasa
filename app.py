@@ -828,9 +828,9 @@ def webhook():
             return jsonify({'status': 'duplicate'}), 200
 
         # Comandos de pausa/retomada manual — Evelin digita no WhatsApp e apaga depois
-        if text_preview.lower() == '//pause':
+        if text_preview.lower() == '//.':
             set_pause(phone)
-            print(f"[PAUSE] {phone} pausado via //pause")
+            print(f"[PAUSE] {phone} pausado via //.")
             return jsonify({'status': 'paused_by_command'}), 200
 
         if text_preview == RESUME_KEYWORD:
