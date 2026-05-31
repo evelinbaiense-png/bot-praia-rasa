@@ -827,10 +827,16 @@ def webhook():
         if is_duplicate_msg(message, phone):
             return jsonify({'status': 'duplicate'}), 200
 
-        # Ignora echo do "." (palavra de retomada) que chega pelo Instance Webhook
-        text_preview = extract_text(message).strip()
+        # Comandos de pausa/retomada manual — Evelin digita no WhatsApp e apaga depois
+        if text_preview.lower() == '//pause':
+            set_pause(phone)
+            print(f"[PAUSE] {phone} pausado via //pause")
+            return jsonify({'status': 'paused_by_command'}), 200
+
         if text_preview == RESUME_KEYWORD:
-            return jsonify({'status': 'resume_echo_ignored'}), 200
+            clear_pause(phone)
+            print(f"[RESUME] {phone} retomado via '.'")
+            return jsonify({'status': 'resumed'}), 200
 
         # ───────────────────────────────────────────────────────────────────
         # 2) MENSAGEM DO CLIENTE — se a conversa está pausada, NÃO responde
