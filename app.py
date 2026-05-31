@@ -501,6 +501,13 @@ FOLLOWUP_STOP_SIGNALS = [
     "até sexta", "até sábado", "até domingo", "te espero lá",
     "já tá anotado", "perfeito! terça", "perfeito! sábado",
     "terça às", "sábado às", "domingo às", "segunda às",
+    "quinta à tarde", "quinta de manhã", "quarta à tarde", "quarta de manhã",
+    "sábado à tarde", "sábado de manhã", "domingo à tarde", "domingo de manhã",
+    "segunda à tarde", "segunda de manhã", "terça à tarde", "terça de manhã",
+    "sexta à tarde", "sexta de manhã",
+    "show, quinta", "show, quarta", "show, terça", "show, sábado",
+    "show, sexta", "show, domingo", "show, segunda",
+    "fechado,", "fechado!", "✅", "te espero", "até lá",
 ]
 
 def is_duplicate_msg(message):
@@ -902,6 +909,11 @@ def webhook():
 
         if media_flag:
             threading.Thread(target=send_media_package, args=(phone,)).start()
+
+        # Detecção imediata de visita confirmada → agenda no Google Calendar
+        updated_history = get_conversation(phone)
+        if is_visit_confirmed(updated_history):
+            threading.Thread(target=extract_and_save_visit, args=(phone, updated_history), daemon=True).start()
 
         return jsonify({'status': 'ok'}), 200
 
