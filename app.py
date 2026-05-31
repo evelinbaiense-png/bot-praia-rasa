@@ -756,14 +756,9 @@ def webhook():
         if not message:
             return jsonify({'status': 'no_message'}), 200
 
-        # Proteção contra duplicatas (Webhook Global + instância disparando ao mesmo tempo)
-        if is_duplicate_msg(message):
-            return jsonify({'status': 'duplicate'}), 200
-
         if message.get('isGroup', False):
             return jsonify({'status': 'group'}), 200
 
-        # Ignorar mensagens editadas (uazapi dispara webhook na edição, causando respostas duplas)
         if (message.get('isEdit') or message.get('updateType') or
                 message.get('messageType', '') in ('messageUpdate', 'editedMessage')):
             return jsonify({'status': 'edit_ignored'}), 200
@@ -771,8 +766,6 @@ def webhook():
         from_me = message.get('fromMe', False)
         is_api  = message.get('wasSentByApi', False)
 
-        # Identifica a CONVERSA (o cliente). chatId aponta pro cliente tanto em
-        # mensagens recebidas quanto nas enviadas por você — por isso vem primeiro.
         convo = message.get('chatId', '') or message.get('sender_pn', '')
         phone = convo.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('@lid', '')
 
@@ -783,15 +776,13 @@ def webhook():
         media_type = message.get('mediaType', '')
 
         # ───────────────────────────────────────────────────────────────────
-        # 1) MENSAGEM ENVIADA PELO PRÓPRIO WHATSAPP (fromMe)
+        # 1) MENSAGEM ENVIADA PELO PRÓPRIO WHATSAPP (fromMe) — ANTES do dedup
         # ───────────────────────────────────────────────────────────────────
         if from_me:
-            # 1a) Foi o BOT que enviou (via API) → ignora.
             if is_api:
                 return jsonify({'status': 'from_bot'}), 200
 
-            # 1b) Foi VOCÊ digitando manualmente.
-            # O número do cliente está no campo top-level 'chat', não em message.chatId
+            # Número do cliente está no campo top-level 'chat'
             chat_data = data.get('chat', {})
             if isinstance(chat_data, dict):
                 raw_client = (chat_data.get('id', '') or
@@ -802,11 +793,9 @@ def webhook():
             else:
                 raw_client = ''
             pause_phone = raw_client.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('@lid', '').replace('+', '') if raw_client else phone
-            print(f"[DEBUG fromMe] chat_data={chat_data} | pause_phone={pause_phone}")
+            print(f"[MANUAL] Você digitou para {pause_phone}: '{extract_text(message).strip()[:40]}'")
 
             manual_text = extract_text(message).strip()
-            print(f"[MANUAL] Você digitou para {pause_phone}: '{manual_text[:40]}'  (fromMe={from_me}, api={is_api})")
-
             if manual_text == RESUME_KEYWORD:
                 clear_pause(pause_phone)
                 return jsonify({'status': 'resumed'}), 200
@@ -815,6 +804,15 @@ def webhook():
             if manual_text:
                 append_message(pause_phone, "assistant", manual_text)
             return jsonify({'status': 'paused_human_takeover'}), 200
+
+        # Proteção contra duplicatas (só para mensagens de clientes)
+        if is_duplicate_msg(message):
+            return jsonify({'status': 'duplicate'}), 200
+
+        # Ignora echo do "." (palavra de retomada) que chega pelo Instance Webhook
+        text_preview = extract_text(message).strip()
+        if text_preview == RESUME_KEYWORD:
+            return jsonify({'status': 'resume_echo_ignored'}), 200
 
         # ───────────────────────────────────────────────────────────────────
         # 2) MENSAGEM DO CLIENTE — se a conversa está pausada, NÃO responde
