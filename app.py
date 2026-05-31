@@ -790,28 +790,19 @@ def webhook():
             if is_api:
                 return jsonify({'status': 'from_bot'}), 200
 
-            # 1b) Foi VOCÊ digitando manualmente — debug pra achar o número do cliente
-            print(f"[DEBUG fromMe] keys: {list(message.keys())}")
-            print(f"[DEBUG fromMe] chatId={message.get('chatId')} | sender_pn={message.get('sender_pn')} | to={message.get('to')} | recipient={message.get('recipient')} | remoteJid={message.get('remoteJid')} | key={message.get('key')}")
-
-            # Tenta extrair o número do CLIENTE (destinatário) quando fromMe=True
-            # O chatId pode vir como o número do bot (remetente) em vez do cliente
-            raw_phone = (
-                message.get('to') or
-                message.get('recipient') or
-                message.get('remoteJid') or
-                (message.get('key') or {}).get('remoteJid', '') or
-                message.get('chatId', '') or
-                message.get('sender_pn', '')
-            )
-            client_phone = raw_phone.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('@lid', '').replace('+', '')
-            # Se o phone extraído for o próprio número do bot, usa o phone já extraído antes
-            bot_own_number = INSTANCE_NAME  # fallback
-            if client_phone and client_phone != phone:
-                pause_phone = client_phone
+            # 1b) Foi VOCÊ digitando manualmente.
+            # O número do cliente está no campo top-level 'chat', não em message.chatId
+            chat_data = data.get('chat', {})
+            if isinstance(chat_data, dict):
+                raw_client = (chat_data.get('id', '') or
+                              chat_data.get('chatId', '') or
+                              chat_data.get('phone', ''))
+            elif isinstance(chat_data, str):
+                raw_client = chat_data
             else:
-                pause_phone = phone
-            print(f"[DEBUG fromMe] phone extraído={phone} | pause_phone={pause_phone}")
+                raw_client = ''
+            pause_phone = raw_client.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('@lid', '').replace('+', '') if raw_client else phone
+            print(f"[DEBUG fromMe] chat_data={chat_data} | pause_phone={pause_phone}")
 
             manual_text = extract_text(message).strip()
             print(f"[MANUAL] Você digitou para {pause_phone}: '{manual_text[:40]}'  (fromMe={from_me}, api={is_api})")
