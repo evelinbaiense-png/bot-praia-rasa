@@ -790,19 +790,39 @@ def webhook():
             if is_api:
                 return jsonify({'status': 'from_bot'}), 200
 
-            # 1b) Foi VOCÊ digitando manualmente.
-            manual_text = extract_text(message).strip()
-            print(f"[MANUAL] Você digitou para {phone}: '{manual_text[:40]}'  (fromMe={from_me}, api={is_api})")
+            # 1b) Foi VOCÊ digitando manualmente — debug pra achar o número do cliente
+            print(f"[DEBUG fromMe] keys: {list(message.keys())}")
+            print(f"[DEBUG fromMe] chatId={message.get('chatId')} | sender_pn={message.get('sender_pn')} | to={message.get('to')} | recipient={message.get('recipient')} | remoteJid={message.get('remoteJid')} | key={message.get('key')}")
 
-            # Palavra-chave para reativar o bot
+            # Tenta extrair o número do CLIENTE (destinatário) quando fromMe=True
+            # O chatId pode vir como o número do bot (remetente) em vez do cliente
+            raw_phone = (
+                message.get('to') or
+                message.get('recipient') or
+                message.get('remoteJid') or
+                (message.get('key') or {}).get('remoteJid', '') or
+                message.get('chatId', '') or
+                message.get('sender_pn', '')
+            )
+            client_phone = raw_phone.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('@lid', '').replace('+', '')
+            # Se o phone extraído for o próprio número do bot, usa o phone já extraído antes
+            bot_own_number = INSTANCE_NAME  # fallback
+            if client_phone and client_phone != phone:
+                pause_phone = client_phone
+            else:
+                pause_phone = phone
+            print(f"[DEBUG fromMe] phone extraído={phone} | pause_phone={pause_phone}")
+
+            manual_text = extract_text(message).strip()
+            print(f"[MANUAL] Você digitou para {pause_phone}: '{manual_text[:40]}'  (fromMe={from_me}, api={is_api})")
+
             if manual_text == RESUME_KEYWORD:
-                clear_pause(phone)
+                clear_pause(pause_phone)
                 return jsonify({'status': 'resumed'}), 200
 
-            # Qualquer outra coisa = você assumiu a conversa → pausa o bot
-            set_pause(phone)
+            set_pause(pause_phone)
             if manual_text:
-                append_message(phone, "assistant", manual_text)  # mantém contexto p/ quando o bot voltar
+                append_message(pause_phone, "assistant", manual_text)
             return jsonify({'status': 'paused_human_takeover'}), 200
 
         # ───────────────────────────────────────────────────────────────────
