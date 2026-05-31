@@ -510,13 +510,12 @@ FOLLOWUP_STOP_SIGNALS = [
     "fechado,", "fechado!", "✅", "te espero", "até lá",
 ]
 
-def is_duplicate_msg(message):
-    """Evita resposta dupla quando o Webhook Global e o da instância disparam ao mesmo tempo."""
+def is_duplicate_msg(message, phone=''):
+    """Evita resposta dupla. Também armazena o phone associado ao messageId."""
     r = get_redis()
     if not r:
         return False
     try:
-        # Tenta extrair o ID único da mensagem em vários formatos do uazapi
         msg_id = (
             message.get('id') or
             message.get('messageId') or
@@ -529,11 +528,32 @@ def is_duplicate_msg(message):
         if r.exists(key):
             print(f"🔁 Mensagem duplicada ignorada: {msg_id[:30]}")
             return True
-        r.setex(key, 30, "1")  # TTL de 30 segundos
+        r.setex(key, 120, phone or "unknown")  # TTL 120s — cobre atraso de 30s do Global
         return False
     except Exception as e:
         print(f"Dedup error: {e}")
         return False
+
+
+def get_phone_from_msg_id(message):
+    """Busca o número do cliente no Redis pelo ID da mensagem (para fromMe handler)."""
+    r = get_redis()
+    if not r:
+        return ''
+    try:
+        msg_id = (
+            message.get('id') or
+            message.get('messageId') or
+            (message.get('key') or {}).get('id', '') or
+            message.get('remoteJid', '') + str(message.get('timestamp', ''))
+        )
+        if not msg_id:
+            return ''
+        cached = r.get(f"dup:{msg_id}")
+        return cached if cached and cached != 'unknown' else ''
+    except Exception as e:
+        print(f"get_phone_from_msg_id error: {e}")
+        return ''
 
 
 def is_visit_confirmed(history):
@@ -782,20 +802,18 @@ def webhook():
             if is_api:
                 return jsonify({'status': 'from_bot'}), 200
 
-            # Número do cliente está no campo top-level 'chat'
-            chat_data = data.get('chat', {})
-            if isinstance(chat_data, dict):
-                raw_client = (chat_data.get('id', '') or
-                              chat_data.get('chatId', '') or
-                              chat_data.get('phone', ''))
-            elif isinstance(chat_data, str):
-                raw_client = chat_data
-            else:
-                raw_client = ''
-            pause_phone = raw_client.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('@lid', '').replace('+', '') if raw_client else phone
-            print(f"[MANUAL] Você digitou para {pause_phone}: '{extract_text(message).strip()[:40]}'")
+            # Busca o número do cliente no Redis (armazenado quando Instance processou)
+            pause_phone = get_phone_from_msg_id(message)
+            if not pause_phone:
+                # Fallback: tenta campo chat do payload
+                chat_data = data.get('chat', {})
+                raw = (chat_data.get('phone', '') or chat_data.get('jid', '') or
+                       chat_data.get('chatId', '')) if isinstance(chat_data, dict) else ''
+                pause_phone = raw.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('+', '') if raw else phone
 
             manual_text = extract_text(message).strip()
+            print(f"[MANUAL] Você digitou para {pause_phone}: '{manual_text[:40]}'")
+
             if manual_text == RESUME_KEYWORD:
                 clear_pause(pause_phone)
                 return jsonify({'status': 'resumed'}), 200
@@ -805,8 +823,8 @@ def webhook():
                 append_message(pause_phone, "assistant", manual_text)
             return jsonify({'status': 'paused_human_takeover'}), 200
 
-        # Proteção contra duplicatas (só para mensagens de clientes)
-        if is_duplicate_msg(message):
+        # Proteção contra duplicatas (só para mensagens de clientes) — armazena phone
+        if is_duplicate_msg(message, phone):
             return jsonify({'status': 'duplicate'}), 200
 
         # Ignora echo do "." (palavra de retomada) que chega pelo Instance Webhook
