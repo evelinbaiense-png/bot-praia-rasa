@@ -18,30 +18,36 @@ UAZAPI_URL        = os.environ.get('UAZAPI_URL', 'https://evelinabreu.uazapi.com
 UAZAPI_TOKEN      = os.environ.get('UAZAPI_TOKEN')
 INSTANCE_NAME     = os.environ.get('INSTANCE_NAME', 'evelin')
 RECOVERY_INTERVAL_HOURS = float(os.environ.get('RECOVERY_INTERVAL_HOURS', '2'))
+RECOVERY_DAY_START      = int(os.environ.get('RECOVERY_DAY_START', '9'))   # não dispara antes das 9h
+RECOVERY_DAY_END        = int(os.environ.get('RECOVERY_DAY_END', '19'))    # nem depois das 19h
 ALERT_NUMBERS     = ['5522999004419', '5522995511909']
 
 # ─── TRAVA DE PAUSA (ATENDIMENTO HUMANO) ─────────────────────────────────────
-RESUME_KEYWORD = '.'
-PAUSE_TTL = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
+# Quando a Evelin digita manualmente numa conversa, o bot PAUSA aquele contato.
+# Ele só volta quando ela enviar a palavra-chave abaixo, ou após PAUSE_TTL.
+RESUME_KEYWORD = '.'                                              # ponto final pra reativar o bot
+PAUSE_TTL = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600   # tempo de segurança (12h padrão)
 
 # ─── FOLLOW-UP AUTOMÁTICO (REENGAJAMENTO) ────────────────────────────────────
+# Quando o cliente para de responder, o bot cutuca de novo em 3 estágios.
 FOLLOWUP_ENABLED    = os.environ.get('FOLLOWUP_ENABLED', 'true').lower() == 'true'
-FOLLOWUP_STAGE1_MIN = int(os.environ.get('FOLLOWUP_STAGE1_MIN', '10'))
-FOLLOWUP_STAGE2_MIN = int(os.environ.get('FOLLOWUP_STAGE2_MIN', '60'))
-FOLLOWUP_STAGE3_MIN = int(os.environ.get('FOLLOWUP_STAGE3_MIN', '360'))
-FOLLOWUP_DAY_START  = int(os.environ.get('FOLLOWUP_DAY_START', '8'))
-FOLLOWUP_DAY_END    = int(os.environ.get('FOLLOWUP_DAY_END', '21'))
-FOLLOWUP_CHECK_MIN  = int(os.environ.get('FOLLOWUP_CHECK_MIN', '5'))
+FOLLOWUP_STAGE1_MIN = int(os.environ.get('FOLLOWUP_STAGE1_MIN', '10'))    # 1º toque: poucos minutos
+FOLLOWUP_STAGE2_MIN = int(os.environ.get('FOLLOWUP_STAGE2_MIN', '60'))    # 2º toque: ~1 hora
+FOLLOWUP_STAGE3_MIN = int(os.environ.get('FOLLOWUP_STAGE3_MIN', '360'))   # 3º toque: ~6h (e só à noite)
+FOLLOWUP_DAY_START  = int(os.environ.get('FOLLOWUP_DAY_START', '8'))      # não cutuca antes das 8h
+FOLLOWUP_DAY_END    = int(os.environ.get('FOLLOWUP_DAY_END', '21'))       # nem depois das 21h
+FOLLOWUP_CHECK_MIN  = int(os.environ.get('FOLLOWUP_CHECK_MIN', '5'))      # verifica a cada 5 min
 
 # ─── REDIS (MEMÓRIA PERSISTENTE) ─────────────────────────────────────────────
 import redis as _redis_lib
 
 REDIS_URL = os.environ.get('REDIS_URL', '')
-CONV_TTL  = 7 * 24 * 3600
+CONV_TTL  = 7 * 24 * 3600  # 7 dias em segundos
 _redis_client = None
 _redis_warned = False
 
 def get_redis():
+    """Conecta no Redis com ping. Loga claramente se falhar (em vez de falhar calado)."""
     global _redis_client, _redis_warned
     if _redis_client is not None:
         return _redis_client
@@ -256,7 +262,7 @@ VALOR À VISTA — nunca ofereça. Só se o cliente perguntar:
 FINANCIAMENTO
 - Direto pela incorporadora, sem SPC/Serasa, sem banco.
 - Primeira parcela em 45 dias. Pode construir com 3 parcelas pagas.
-- Prazo: de 12 a 156 parcelas (12 anos). Se o cliente quiser pagar em menos tempo, pode escolher um prazo menor — de 12 até 156x.
+- Prazo: de 12 a 156 parcelas (13 anos). Se o cliente quiser pagar em menos tempo, pode escolher um prazo menor — de 12 até 156x.
 - IGPM: índice de correção anual, uma vez por ano.
 - Para simular parcelas em prazo específico ou ver tabela completa: direcione para a visita ("o consultor faz a simulação na hora").
 
@@ -311,6 +317,9 @@ def send_video(phone, video_url, caption=""):
 
 
 def send_media_package(phone):
+    """Envia vídeos e fotos + a pergunta de reengajamento.
+    NÃO faz append no histórico: o registro já é feito (consolidado) em get_ai_response,
+    evitando dois turnos de assistant seguidos."""
     try:
         send_message(phone, "Olha só os vídeos do empreendimento 👇")
         send_video(phone, VIDEO_URL_1)
@@ -335,6 +344,8 @@ def send_alert(phone_client):
 
 
 def send_and_check(phone, text):
+    """Envia e confirma. Se a uazapi não retornar 200 (ex.: 503 = WhatsApp
+    desconectado), registra no log e tenta te avisar."""
     resp = send_message(phone, text)
     status = getattr(resp, 'status_code', None) if resp is not None else None
     if status != 200:
@@ -348,6 +359,8 @@ def send_and_check(phone, text):
 
 
 def notify_ai_failure(phone):
+    """Quando a IA falha (sem saldo na API, limite ou instabilidade): te avisa e
+    dá um retorno leve ao cliente, em vez de deixá-lo no vácuo."""
     for number in ALERT_NUMBERS:
         if number != phone:
             send_message(number, f"⚠️ A IA falhou ao responder o cliente {phone}. "
@@ -392,10 +405,13 @@ def extract_text(message):
 # ─── IA ───────────────────────────────────────────────────────────────────────
 
 def get_ai_response(phone, user_message):
+    """Gera a resposta, salva no histórico já LIMPA (sem as tags internas) e
+    retorna (texto_limpo, alert_flag, media_flag)."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     history = append_message(phone, "user", user_message)
 
+    # Contexto de horário (só no system prompt)
     import pytz
     try:
         br_time = datetime.now(pytz.timezone("America/Sao_Paulo"))
@@ -416,12 +432,15 @@ def get_ai_response(phone, user_message):
 
     try:
         response = client.messages.create(
-            model="claude-opus-4-8",
+            model="claude-sonnet-4-6",
             max_tokens=600,
             system=system,
             messages=api_messages
         )
     except Exception as e:
+        # Falha da IA: sem saldo na API (erro 400), limite atingido (429) ou
+        # instabilidade. Em vez de quebrar o webhook e ficar mudo, sinaliza o
+        # erro (reply=None) para o webhook tratar e te avisar.
         print(f"❌ ERRO NA IA (Anthropic) para {phone}: {e}")
         return None, False, False
 
@@ -430,6 +449,8 @@ def get_ai_response(phone, user_message):
     media_flag  = '[ENVIAR_MIDIA]' in reply_raw
     reply_clean = reply_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
 
+    # Histórico: versão limpa (sem tags). Se enviou mídia, registra num ÚNICO turno
+    # de assistant que já inclui a nota da pergunta de reengajamento.
     if media_flag:
         hist_text = reply_clean + "\n[Enviei as fotos e vídeos do empreendimento e perguntei: O que achou?]"
     else:
@@ -442,6 +463,7 @@ def get_ai_response(phone, user_message):
 # ─── FOLLOW-UP (REENGAJAMENTO QUANDO O CLIENTE SOME) ──────────────────────────
 
 def generate_followup(phone, stage):
+    """Gera uma mensagem de reengajamento conforme o estágio, usando o contexto da conversa."""
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         history = get_conversation(phone)
@@ -463,7 +485,7 @@ def generate_followup(phone, stage):
             {"role": "user", "content": "[O cliente ficou em silêncio. Escreva agora a mensagem de retomada, seguindo a instrução.]"}
         ]
         response = client.messages.create(
-            model="claude-opus-4-8",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             system=system,
             messages=api_messages
@@ -491,6 +513,7 @@ FOLLOWUP_STOP_SIGNALS = [
 ]
 
 def is_duplicate_msg(message, phone=''):
+    """Evita resposta dupla. Também armazena o phone associado ao messageId."""
     r = get_redis()
     if not r:
         return False
@@ -507,7 +530,7 @@ def is_duplicate_msg(message, phone=''):
         if r.exists(key):
             print(f"🔁 Mensagem duplicada ignorada: {msg_id[:30]}")
             return True
-        r.setex(key, 120, phone or "unknown")
+        r.setex(key, 120, phone or "unknown")  # TTL 120s — cobre atraso de 30s do Global
         return False
     except Exception as e:
         print(f"Dedup error: {e}")
@@ -515,6 +538,7 @@ def is_duplicate_msg(message, phone=''):
 
 
 def get_phone_from_msg_id(message):
+    """Busca o número do cliente no Redis pelo ID da mensagem (para fromMe handler)."""
     r = get_redis()
     if not r:
         return ''
@@ -535,6 +559,7 @@ def get_phone_from_msg_id(message):
 
 
 def is_visit_confirmed(history):
+    """True se o histórico recente indica que a visita já foi agendada — para os follow-ups."""
     assistant_texts = " ".join(
         m.get("content", "").lower()
         for m in history[-10:]
@@ -543,11 +568,13 @@ def is_visit_confirmed(history):
     return any(s in assistant_texts for s in FOLLOWUP_STOP_SIGNALS)
 
 
+
 # ─── GOOGLE CALENDAR + LEMBRETE DE VISITA ────────────────────────────────────
 
 CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'evelinbaiense@gmail.com')
 
 def get_calendar_service():
+    """Retorna o serviço do Google Calendar usando as credenciais da service account."""
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
@@ -565,6 +592,7 @@ def get_calendar_service():
 
 
 def next_weekday_date(day_name):
+    """Calcula a próxima data para um dia da semana em português."""
     days_map = {
         'segunda': 0, 'terça': 1, 'terca': 1, 'quarta': 2,
         'quinta': 3, 'sexta': 4, 'sábado': 5, 'sabado': 5, 'domingo': 6
@@ -590,16 +618,17 @@ def next_weekday_date(day_name):
 
 
 def extract_and_save_visit(phone, history):
+    """Extrai detalhes da visita do histórico, salva no Redis e cria evento no Google Agenda."""
     r = get_redis()
     if not r:
         return
     if r.exists(f"visit:{phone}"):
-        return
+        return  # já salvo
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         recent_text = json.dumps(history[-12:], ensure_ascii=False)
         response = client.messages.create(
-            model="claude-opus-4-8",
+            model="claude-sonnet-4-6",
             max_tokens=150,
             messages=[{
                 "role": "user",
@@ -620,6 +649,7 @@ def extract_and_save_visit(phone, history):
         visit_info = {'name': name, 'phone': phone, 'day': day, 'period': period, 'date': visit_date}
         r.setex(f"visit:{phone}", 30 * 24 * 3600, json.dumps(visit_info))
         print(f"📅 Visita salva: {name} — {day} {period} ({visit_date})")
+        # Google Agenda
         if visit_date:
             service = get_calendar_service()
             if service:
@@ -638,6 +668,7 @@ def extract_and_save_visit(phone, history):
 
 
 def visit_reminder_sweep():
+    """Roda diariamente às 8h: envia lembrete de visita de amanhã pro WhatsApp da Evelin."""
     r = get_redis()
     if not r:
         return
@@ -675,6 +706,7 @@ def visit_reminder_sweep():
 
 
 def followup_sweep():
+    """Roda de tempos em tempos: cutuca clientes que pararam de responder, em 3 estágios."""
     if not FOLLOWUP_ENABLED:
         return
     r = get_redis()
@@ -685,6 +717,7 @@ def followup_sweep():
         hora = datetime.now(pytz.timezone("America/Sao_Paulo")).hour
     except Exception:
         hora = 12
+    # Não incomoda de madrugada
     if not (FOLLOWUP_DAY_START <= hora < FOLLOWUP_DAY_END):
         return
     now = time.time()
@@ -701,11 +734,13 @@ def followup_sweep():
                 continue
             silent_min = (now - state.get("last_client_ts", now)) / 60.0
             history = get_conversation(phone)
+            # Só cutuca se o último a falar foi o BOT (cliente realmente não respondeu)
             if not history or history[-1].get("role") != "assistant":
                 continue
+            # Para se a visita já foi confirmada
             if is_visit_confirmed(history):
                 extract_and_save_visit(phone, history)
-                state["stage"] = 3
+                state["stage"] = 3  # encerra o ciclo
                 set_followup_state(phone, state)
                 continue
             next_stage = None
@@ -714,7 +749,7 @@ def followup_sweep():
             elif stage == 1 and silent_min >= FOLLOWUP_STAGE2_MIN:
                 next_stage = 2
             elif stage == 2 and silent_min >= FOLLOWUP_STAGE3_MIN and hora >= 18:
-                next_stage = 3
+                next_stage = 3   # 3º toque só à noite
             if not next_stage:
                 continue
             msg = generate_followup(phone, next_stage)
@@ -769,8 +804,10 @@ def webhook():
             if is_api:
                 return jsonify({'status': 'from_bot'}), 200
 
+            # Busca o número do cliente no Redis (armazenado quando Instance processou)
             pause_phone = get_phone_from_msg_id(message)
             if not pause_phone:
+                # Fallback: tenta campo chat do payload
                 chat_data = data.get('chat', {})
                 raw = (chat_data.get('phone', '') or chat_data.get('jid', '') or
                        chat_data.get('chatId', '')) if isinstance(chat_data, dict) else ''
@@ -788,22 +825,17 @@ def webhook():
                 append_message(pause_phone, "assistant", manual_text)
             return jsonify({'status': 'paused_human_takeover'}), 200
 
-        # Proteção contra duplicatas (só para mensagens de clientes)
+        # Proteção contra duplicatas (só para mensagens de clientes) — armazena phone
         if is_duplicate_msg(message, phone):
             return jsonify({'status': 'duplicate'}), 200
 
-        # ───────────────────────────────────────────────────────────────────
-        # COMANDOS MANUAIS — digitados por você na conversa do cliente
-        # FIX: text_preview estava sendo usado antes de ser definido (NameError)
-        # ───────────────────────────────────────────────────────────────────
-        _text_cmd = extract_text(message).strip()
-
-        if _text_cmd == '//.':
+        # Comandos de pausa/retomada manual — Evelin digita no WhatsApp e apaga depois
+        if text_preview.lower() == '//.':
             set_pause(phone)
             print(f"[PAUSE] {phone} pausado via //.")
             return jsonify({'status': 'paused_by_command'}), 200
 
-        if _text_cmd == RESUME_KEYWORD:
+        if text_preview == RESUME_KEYWORD:
             clear_pause(phone)
             print(f"[RESUME] {phone} retomado via '.'")
             return jsonify({'status': 'resumed'}), 200
@@ -812,15 +844,16 @@ def webhook():
         # 2) MENSAGEM DO CLIENTE — se a conversa está pausada, NÃO responde
         # ───────────────────────────────────────────────────────────────────
         if is_paused(phone):
-            txt = _text_cmd
+            txt = extract_text(message).strip()
             if txt:
-                append_message(phone, "user", txt)
+                append_message(phone, "user", txt)  # guarda contexto, sem responder
             print(f"⏸️  {phone} está em atendimento humano — bot não respondeu.")
             return jsonify({'status': 'paused_no_reply'}), 200
 
         # ───────────────────────────────────────────────────────────────────
         # 3) FLUXO NORMAL DO BOT
         # ───────────────────────────────────────────────────────────────────
+        # Cliente está ativo agora → zera o ciclo de follow-up
         set_followup_state(phone, {"last_client_ts": time.time(), "stage": 0})
 
         text = ""
@@ -862,7 +895,7 @@ def webhook():
 
         # Texto
         elif msg_type in ('text', 'Conversation', 'extendedTextMessage'):
-            text = _text_cmd  # já extraído acima, reutiliza
+            text = extract_text(message).strip()
 
         # Cliente enviou imagem/vídeo
         elif msg_type == 'media' and media_type in ('image', 'video', 'sticker', 'document'):
@@ -890,7 +923,8 @@ def webhook():
             notify_ai_failure(phone)
             return jsonify({'status': 'ai_error'}), 200
 
-        # Rede de segurança: cliente aceitou ver mídia sem o modelo emitir a tag
+        # Rede de segurança: se o modelo não emitiu a tag mas o cliente claramente
+        # aceitou ver mídia logo após você oferecer.
         if not media_flag:
             media_keywords = ['quero ver', 'queria ver', 'pode mandar', 'manda sim',
                               'com certeza', 'claro que sim', 'quero as fotos',
@@ -944,22 +978,49 @@ def load_recovery_contacts():
 
 def send_recovery_message():
     global recovery_index, recovery_contacts
+
+    # ── Horário comercial: só dispara entre RECOVERY_DAY_START e RECOVERY_DAY_END
+    try:
+        import pytz
+        hora = datetime.now(pytz.timezone("America/Sao_Paulo")).hour
+    except Exception:
+        hora = 12
+    if not (RECOVERY_DAY_START <= hora < RECOVERY_DAY_END):
+        print(f"⏰ Recovery fora do horário comercial ({hora}h) — pulando.")
+        return
+
     load_recovery_contacts()
     if not recovery_contacts or recovery_index >= len(recovery_contacts):
         recovery_index = 0
         return
+
     contact = recovery_contacts[recovery_index]
     phone = contact.get('telefone', '').replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
     name  = contact.get('nome', '')
     custom_msg = contact.get('mensagem', '')
+
     if not phone:
         recovery_index += 1
         return
+
+    # Não dispara recovery em quem está em atendimento humano
     if is_paused(phone):
+        print(f"⏸️ Recovery pulado — {phone} em atendimento humano.")
         recovery_index += 1
         return
+
+    # Não dispara para quem já recebeu (dedup via Redis — TTL 30 dias)
+    r = get_redis()
+    if r and r.exists(f"rec_sent:{phone}"):
+        print(f"🔁 Recovery já enviado para {phone} — pulando.")
+        recovery_index += 1
+        return
+
     message = custom_msg or f"Oi{' ' + name if name else ''}! Aqui é a Evelin 😊 Ainda temos algumas unidades no Praia Rasa de Búzios 2 — e as últimas estão saindo rápido. Você ainda tem interesse? Me avisa antes de visitar que garanto seu atendimento!"
-    send_message(phone, message)
+    if send_and_check(phone, message):
+        if r:
+            r.setex(f"rec_sent:{phone}", 30 * 24 * 3600, "1")
+        print(f"📨 Recovery enviado para {phone} ({name})")
     recovery_index += 1
 
 
@@ -1009,12 +1070,11 @@ def start_recovery():
 # ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    get_redis()
+    get_redis()  # conecta e loga o estado da memória logo no start
     scheduler = BackgroundScheduler()
     scheduler.add_job(send_recovery_message, 'interval', hours=RECOVERY_INTERVAL_HOURS)
     scheduler.add_job(followup_sweep, 'interval', minutes=FOLLOWUP_CHECK_MIN)
-    scheduler.add_job(visit_reminder_sweep, 'interval', minutes=30)
+    scheduler.add_job(visit_reminder_sweep, 'interval', minutes=30)  # verifica a cada 30min, age só às 8h
     scheduler.start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
