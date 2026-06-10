@@ -20,6 +20,11 @@ INSTANCE_NAME     = os.environ.get('INSTANCE_NAME', 'evelin')
 RECOVERY_INTERVAL_HOURS = float(os.environ.get('RECOVERY_INTERVAL_HOURS', '2'))
 ALERT_NUMBERS     = ['5522999004419', '5522995511909']
 
+# ─── MODELO ──────────────────────────────────────────────────────────────────
+# claude-haiku-4-5-20251001 → ~15x mais barato que Opus, suficiente para vendas
+AI_MODEL          = os.environ.get('AI_MODEL', 'claude-haiku-4-5-20251001')
+HISTORY_LIMIT     = int(os.environ.get('HISTORY_LIMIT', '8'))  # era 20, reduzido para -85% de custo
+
 # ─── TRAVA DE PAUSA (ATENDIMENTO HUMANO) ─────────────────────────────────────
 RESUME_KEYWORD = '.'
 PAUSE_TTL = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
@@ -409,15 +414,16 @@ def get_ai_response(phone, user_message):
 
     system = SYSTEM_PROMPT + time_info
 
-    last_20 = history[-20:]
+    # HISTORY_LIMIT reduzido de 20 para 8 — economia de ~60% nos tokens de entrada
+    last_msgs = history[-HISTORY_LIMIT:]
     api_messages = [
         {"role": "user",      "content": "Olá"},
         {"role": "assistant", "content": GREETING},
-    ] + last_20
+    ] + last_msgs
 
     try:
         response = client.messages.create(
-            model="claude-opus-4-8",
+            model=AI_MODEL,
             max_tokens=600,
             system=system,
             messages=api_messages
@@ -456,15 +462,16 @@ def generate_followup(phone, stage):
             f"{situ.get(stage, situ[1])} Gere SÓ a mensagem, curta e natural. "
             f"NÃO cumprimente de novo — a conversa já está em andamento.]"
         )
-        last_20 = history[-20:]
+        # Histórico reduzido também no follow-up
+        last_msgs = history[-HISTORY_LIMIT:]
         api_messages = [
             {"role": "user",      "content": "Olá"},
             {"role": "assistant", "content": GREETING},
-        ] + last_20 + [
+        ] + last_msgs + [
             {"role": "user", "content": "[O cliente ficou em silêncio. Escreva agora a mensagem de retomada, seguindo a instrução.]"}
         ]
         response = client.messages.create(
-            model="claude-opus-4-8",
+            model=AI_MODEL,
             max_tokens=300,
             system=system,
             messages=api_messages
@@ -600,7 +607,7 @@ def extract_and_save_visit(phone, history):
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         recent_text = json.dumps(history[-12:], ensure_ascii=False)
         response = client.messages.create(
-            model="claude-opus-4-8",
+            model=AI_MODEL,
             max_tokens=150,
             messages=[{
                 "role": "user",
@@ -789,15 +796,15 @@ def webhook():
                 append_message(pause_phone, "assistant", manual_text)
             return jsonify({'status': 'paused_human_takeover'}), 200
 
-        # Proteção contra duplicatas (só para mensagens de clientes) — armazena phone
+        # Proteção contra duplicatas (só para mensagens de clientes)
         if is_duplicate_msg(message, phone):
             return jsonify({'status': 'duplicate'}), 200
 
         # ── Define text_cmd AQUI, antes de qualquer verificação de comando ──
         text_cmd = extract_text(message).strip()
 
-        # Comandos de pausa/retomada manual — Evelin digita no WhatsApp e apaga depois
-        if text_cmd.lower() == '//.':
+        # Comandos de pausa/retomada manual
+        if text_cmd.lower() == '//.' :
             set_pause(phone)
             print(f"[PAUSE] {phone} pausado via //.")
             return jsonify({'status': 'paused_by_command'}), 200
@@ -978,6 +985,8 @@ def health():
         'status': 'running',
         'redis': 'ok' if redis_ok else 'OFFLINE',
         'memory_enabled': redis_ok,
+        'model': AI_MODEL,
+        'history_limit': HISTORY_LIMIT,
         'timestamp': datetime.now().isoformat()
     }), 200
 
