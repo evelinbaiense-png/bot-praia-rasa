@@ -6,30 +6,32 @@ import os
 import time
 import tempfile
 import threading
+import math
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 import csv
 
 app = Flask(__name__)
 
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
-OPENAI_API_KEY    = os.environ.get('OPENAI_API_KEY')
-UAZAPI_URL        = os.environ.get('UAZAPI_URL', 'https://evelinabreu.uazapi.com')
-UAZAPI_TOKEN      = os.environ.get('UAZAPI_TOKEN')
-INSTANCE_NAME     = os.environ.get('INSTANCE_NAME', 'evelin')
+# ─── CONFIGURAÇÕES ────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY       = os.environ.get('ANTHROPIC_API_KEY')
+OPENAI_API_KEY          = os.environ.get('OPENAI_API_KEY')
+UAZAPI_URL              = os.environ.get('UAZAPI_URL', 'https://evelinabreu.uazapi.com')
+UAZAPI_TOKEN            = os.environ.get('UAZAPI_TOKEN')
+INSTANCE_NAME           = os.environ.get('INSTANCE_NAME', 'evelin')
 RECOVERY_INTERVAL_HOURS = float(os.environ.get('RECOVERY_INTERVAL_HOURS', '2'))
-ALERT_NUMBERS     = ['5522999004419', '5522995511909']
+ALERT_NUMBERS           = ['5522999004419', '5522995511909']
 
 # ─── MODELO ──────────────────────────────────────────────────────────────────
-# claude-haiku-4-5-20251001 → ~15x mais barato que Opus, suficiente para vendas
-AI_MODEL          = os.environ.get('AI_MODEL', 'claude-haiku-4-5-20251001')
-HISTORY_LIMIT     = int(os.environ.get('HISTORY_LIMIT', '8'))  # era 20, reduzido para -85% de custo
+# claude-haiku-4-5-20251001 = ~15x mais barato que Opus, suficiente para vendas
+AI_MODEL      = os.environ.get('AI_MODEL', 'claude-haiku-4-5-20251001')
+HISTORY_LIMIT = int(os.environ.get('HISTORY_LIMIT', '8'))
 
-# ─── TRAVA DE PAUSA (ATENDIMENTO HUMANO) ─────────────────────────────────────
+# ─── TRAVA DE PAUSA ──────────────────────────────────────────────────────────
 RESUME_KEYWORD = '.'
-PAUSE_TTL = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
+PAUSE_TTL      = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
 
-# ─── FOLLOW-UP AUTOMÁTICO (REENGAJAMENTO) ────────────────────────────────────
+# ─── FOLLOW-UP ───────────────────────────────────────────────────────────────
 FOLLOWUP_ENABLED    = os.environ.get('FOLLOWUP_ENABLED', 'true').lower() == 'true'
 FOLLOWUP_STAGE1_MIN = int(os.environ.get('FOLLOWUP_STAGE1_MIN', '10'))
 FOLLOWUP_STAGE2_MIN = int(os.environ.get('FOLLOWUP_STAGE2_MIN', '60'))
@@ -38,13 +40,84 @@ FOLLOWUP_DAY_START  = int(os.environ.get('FOLLOWUP_DAY_START', '8'))
 FOLLOWUP_DAY_END    = int(os.environ.get('FOLLOWUP_DAY_END', '21'))
 FOLLOWUP_CHECK_MIN  = int(os.environ.get('FOLLOWUP_CHECK_MIN', '5'))
 
-# ─── REDIS (MEMÓRIA PERSISTENTE) ─────────────────────────────────────────────
+# ─── MENSAGEM AUTOMÁTICA DO FACEBOOK ─────────────────────────────────────────
+# Primeira mensagem (fromMe): saudação automática do anúncio → ignorar
+# Segunda mensagem (do cliente): texto do botão → tratar como intenção real
+FB_AUTO_GREETING_KEYWORDS = [
+    'mensagem de saudação automática',
+    'que bom ter você por aqui',
+    'os lotes ficam a poucos minutos da praia',
+]
+FB_AD_BUTTON_TEXT = 'gostaria de saber valores e disponibilidade'
+
+# ─── COORDENADAS DO EMPREENDIMENTO ───────────────────────────────────────────
+EMPREENDIMENTO_LAT = -22.7238716
+EMPREENDIMENTO_LNG = -42.001362
+
+# ─── REFERÊNCIAS GEOGRÁFICAS CONHECIDAS ──────────────────────────────────────
+REFERENCIAS_CONHECIDAS = {
+    'pórtico':           {'dist_km': 11,  'desc': 'Pórtico de Búzios'},
+    'portico':           {'dist_km': 11,  'desc': 'Pórtico de Búzios'},
+    'cruzeiro':          {'dist_km': 5,   'desc': 'Praça do Cruzeiro'},
+    'inej':              {'dist_km': 5,   'desc': 'INEJ'},
+    'inef':              {'dist_km': 5,   'desc': 'INEJ'},
+    'praia rasa':        {'dist_km': 0.8, 'desc': 'Praia Rasa'},
+    'geribá':            {'dist_km': 8,   'desc': 'Praia do Geribá'},
+    'geriba':            {'dist_km': 8,   'desc': 'Praia do Geribá'},
+    'cabo frio':         {'dist_km': 18,  'desc': 'Cabo Frio centro'},
+    'arraial do cabo':   {'dist_km': 25,  'desc': 'Arraial do Cabo'},
+    'arraial':           {'dist_km': 25,  'desc': 'Arraial do Cabo'},
+    'búzios':            {'dist_km': 11,  'desc': 'centro de Búzios'},
+    'buzios':            {'dist_km': 11,  'desc': 'centro de Búzios'},
+    'praia do forte':    {'dist_km': 12,  'desc': 'Praia do Forte'},
+    'ferradura':         {'dist_km': 14,  'desc': 'Praia da Ferradura'},
+    'tucuns':            {'dist_km': 13,  'desc': 'Praia de Tucuns'},
+    'joão fernandes':    {'dist_km': 16,  'desc': 'Praia de João Fernandes'},
+    'joao fernandes':    {'dist_km': 16,  'desc': 'Praia de João Fernandes'},
+    'manguinhos':        {'dist_km': 9,   'desc': 'Praia de Manguinhos'},
+    'rasa':              {'dist_km': 2,   'desc': 'Vila da Rasa'},
+    'rj-106':            {'dist_km': 0,   'desc': 'RJ-106'},
+}
+
+def buscar_distancia_referencia(texto):
+    texto_lower = texto.lower()
+    for chave, dados in REFERENCIAS_CONHECIDAS.items():
+        if chave in texto_lower:
+            return dados
+    return None
+
+def buscar_distancia_osm(local_nome):
+    """Fallback: busca via OpenStreetMap Nominatim — 100% gratuito, sem API key."""
+    try:
+        url    = "https://nominatim.openstreetmap.org/search"
+        params = {'q': f"{local_nome}, Búzios, Rio de Janeiro, Brasil", 'format': 'json', 'limit': 1}
+        headers = {'User-Agent': 'BotPraiaRasa/1.0'}
+        resp   = requests.get(url, params=params, headers=headers, timeout=5)
+        data   = resp.json() if resp.status_code == 200 else []
+        if not data:
+            params['q'] = f"{local_nome}, Rio de Janeiro, Brasil"
+            resp = requests.get(url, params=params, headers=headers, timeout=5)
+            data = resp.json() if resp.status_code == 200 else []
+        if not data:
+            return None
+        lat = float(data[0]['lat'])
+        lng = float(data[0]['lon'])
+        R   = 6371
+        dlat = math.radians(lat - EMPREENDIMENTO_LAT)
+        dlng = math.radians(lng - EMPREENDIMENTO_LNG)
+        a    = math.sin(dlat/2)**2 + math.cos(math.radians(EMPREENDIMENTO_LAT)) * math.cos(math.radians(lat)) * math.sin(dlng/2)**2
+        return round(R * 2 * math.asin(math.sqrt(a)), 1)
+    except Exception as e:
+        print(f"OSM error: {e}")
+        return None
+
+# ─── REDIS ───────────────────────────────────────────────────────────────────
 import redis as _redis_lib
 
-REDIS_URL = os.environ.get('REDIS_URL', '')
-CONV_TTL  = 7 * 24 * 3600
-_redis_client = None
-_redis_warned = False
+REDIS_URL      = os.environ.get('REDIS_URL', '')
+CONV_TTL       = 7 * 24 * 3600
+_redis_client  = None
+_redis_warned  = False
 
 def get_redis():
     global _redis_client, _redis_warned
@@ -52,27 +125,24 @@ def get_redis():
         return _redis_client
     if not REDIS_URL:
         if not _redis_warned:
-            print("⚠️⚠️⚠️ REDIS_URL NÃO CONFIGURADA — O BOT ESTÁ SEM MEMÓRIA! "
-                  "Ele vai tratar cada mensagem como conversa nova. Configure REDIS_URL no Railway.")
+            print("⚠️ REDIS_URL NÃO CONFIGURADA — memória desligada.")
             _redis_warned = True
         return None
     try:
         client = _redis_lib.from_url(REDIS_URL, decode_responses=True)
         client.ping()
         _redis_client = client
-        print("✅ Redis conectado — memória ativa.")
+        print("✅ Redis conectado.")
         return _redis_client
     except Exception as e:
         if not _redis_warned:
-            print(f"❌❌❌ FALHA AO CONECTAR NO REDIS: {e} — MEMÓRIA DESLIGADA. "
-                  "O bot vai se perder. Verifique o serviço Redis.")
+            print(f"❌ FALHA REDIS: {e}")
             _redis_warned = True
         return None
 
 def get_conversation(phone):
     r = get_redis()
-    if not r:
-        return []
+    if not r: return []
     try:
         data = r.get(f"conv:{phone}")
         return json.loads(data) if data else []
@@ -82,8 +152,7 @@ def get_conversation(phone):
 
 def save_conversation(phone, messages):
     r = get_redis()
-    if not r:
-        return
+    if not r: return
     try:
         r.setex(f"conv:{phone}", CONV_TTL, json.dumps(messages))
     except Exception as e:
@@ -95,11 +164,9 @@ def append_message(phone, role, content):
     save_conversation(phone, history)
     return history
 
-# ── Funções da trava de pausa ────────────────────────────────────────────────
 def is_paused(phone):
     r = get_redis()
-    if not r:
-        return False
+    if not r: return False
     try:
         return r.exists(f"pause:{phone}") == 1
     except Exception as e:
@@ -108,29 +175,25 @@ def is_paused(phone):
 
 def set_pause(phone):
     r = get_redis()
-    if not r:
-        return
+    if not r: return
     try:
         r.setex(f"pause:{phone}", PAUSE_TTL, "1")
-        print(f"⏸️  Bot PAUSADO para {phone} (atendimento humano).")
+        print(f"⏸️  Bot PAUSADO para {phone}.")
     except Exception as e:
         print(f"Redis set_pause error ({phone}): {e}")
 
 def clear_pause(phone):
     r = get_redis()
-    if not r:
-        return
+    if not r: return
     try:
         r.delete(f"pause:{phone}")
         print(f"▶️  Bot REATIVADO para {phone}.")
     except Exception as e:
         print(f"Redis clear_pause error ({phone}): {e}")
 
-# ── Estado do follow-up por conversa ─────────────────────────────────────────
 def get_followup_state(phone):
     r = get_redis()
-    if not r:
-        return None
+    if not r: return None
     try:
         data = r.get(f"fu:{phone}")
         return json.loads(data) if data else None
@@ -140,15 +203,13 @@ def get_followup_state(phone):
 
 def set_followup_state(phone, state):
     r = get_redis()
-    if not r:
-        return
+    if not r: return
     try:
         r.setex(f"fu:{phone}", CONV_TTL, json.dumps(state))
     except Exception as e:
         print(f"Redis fu set error ({phone}): {e}")
 
 # ─── MÍDIAS ──────────────────────────────────────────────────────────────────
-
 PHOTOS = [
     "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.56_itxlrx.jpg",
     "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.57_wmlvhl.jpg",
@@ -161,91 +222,116 @@ PHOTOS = [
 VIDEO_URL_1 = "https://res.cloudinary.com/dd6o3z4ma/video/upload/v1779039974/WhatsApp_Video_2026-05-17_at_13.15.06_zrc6fs.mp4"
 VIDEO_URL_2 = "https://res.cloudinary.com/dd6o3z4ma/video/upload/v1779039973/WhatsApp_Video_2026-05-17_at_13.19.32_b5ptia.mp4"
 
-# ─── MENSAGENS ────────────────────────────────────────────────────────────────
-
+# ─── TEXTOS ──────────────────────────────────────────────────────────────────
 GREETING = "Oi! Aqui é a Evelin Abreu, corretora de imóveis. Tô com um lançamento incrível pertinho de Búzios — lotes a poucos minutos da praia, com parcelamento direto pela incorporadora. Você já ouviu falar do Praia Rasa de Búzios 2 ou é a primeira vez?"
 
 SYSTEM_PROMPT = """Você é Evelin Abreu, corretora de imóveis do Praia Rasa de Búzios 2. Atenda como a própria Evelin no WhatsApp — simpática, direta, como um bate-papo profissional. Nunca revele que é IA. Se perguntarem, é a própria Evelin.
 
 ═══════════════════════════════════════════
+PRIMEIRA MENSAGEM DO CLIENTE (vinda do anúncio do Facebook)
+═══════════════════════════════════════════
+Se a primeira mensagem for "Olá! Gostaria de saber valores e disponibilidade" ou similar:
+- O cliente acabou de clicar no anúncio — é intenção real de compra
+- Responda com simpatia, qualifique rapidamente (morar/veraneio/investir) e já mostre o empreendimento
+- NÃO trate como conversa avançada — é o início
+
+═══════════════════════════════════════════
+REGRA PRINCIPAL: RESPONDA A PERGUNTA PRIMEIRO
+═══════════════════════════════════════════
+Se o cliente fizer uma pergunta direta (localização, preço, documentação, etc.):
+1. RESPONDA A PERGUNTA PRIMEIRO
+2. Só depois avance no fluxo de vendas
+NUNCA ignore uma pergunta direta para seguir o script.
+
+═══════════════════════════════════════════
 SEU FLUXO NATURAL
 ═══════════════════════════════════════════
-Siga essa ordem quando o cliente deixar você conduzir. Se ele puxar outro assunto primeiro, acompanhe — não force a ordem.
+Siga essa ordem quando o cliente deixar você conduzir.
 
 PASSO 1 — Descubra o objetivo:
-Pergunte de forma curta: "Você está pensando em morar, ter uma casa de veraneio ou investir?"
+"Você está pensando em morar, ter uma casa de veraneio ou investir?"
 
-PASSO 2 — Mande as fotos e vídeos (sempre, independente da resposta):
-Não peça permissão — avise e mande direto: "Deixa eu já te mostrar o empreendimento!" + [ENVIAR_MIDIA]
+PASSO 2 — Mande as fotos e vídeos:
+"Deixa eu já te mostrar o empreendimento!" + [ENVIAR_MIDIA]
 
-PASSO 3 — Pergunte se pode mandar a localização:
+PASSO 3 — Localização:
 "Posso te mandar a localização pra você ter uma ideia de onde fica?"
-Se sim: envie o link https://www.google.com/maps/@-22.7238716,-42.001362,493m
+Se sim: https://www.google.com/maps/@-22.7238716,-42.001362,493m
 
-PASSO 4 — Pergunte se pode mandar os valores:
+PASSO 4 — Valores:
 "Posso te passar os valores dos lotes?"
-Se sim: apresente os lotes 300m² e 600m² com as PARCELAS.
-⚠️ NUNCA mencione valor à vista por iniciativa própria. Só se o cliente perguntar explicitamente.
+Se sim: apresente 300m² e 600m² com PARCELAS.
+⚠️ NUNCA mencione valor à vista por iniciativa. Só se perguntarem.
 
-PASSO 5 — Conduza naturalmente:
-Com objetivo, mídias, localização e valores passados, qualifique conforme a conversa e conduza para a visita quando sentir abertura.
+PASSO 5 — Conduza para a visita.
+
+═══════════════════════════════════════════
+LOCALIZAÇÃO — USE ESTAS DISTÂNCIAS
+═══════════════════════════════════════════
+Empreendimento: Estrada dos Búzios (RJ-106), Bairro da Rasa, divisa Búzios/Cabo Frio.
+Fica na MARGEM DIREITA da RJ-106 sentido Búzios.
+(Lado esquerdo é reserva da Marinha — não existe empreendimento lá)
+
+DISTÂNCIAS CONFIRMADAS — responda diretamente quando perguntarem:
+- Praia Rasa: 800m (3 min a pé)
+- Praça do Cruzeiro (Rasa): ~5km
+- INEJ: ~5km
+- Vila da Rasa: ~2km
+- Praia de Manguinhos: ~9km
+- Praia do Geribá: ~8km
+- Pórtico de Búzios: ~11km
+- Centro de Búzios: ~11km
+- Praia da Ferradura: ~14km
+- Praia de Tucuns: ~13km
+- Praia do Forte: ~12km
+- Praia de João Fernandes: ~16km
+- Cabo Frio centro: ~18km
+- Arraial do Cabo: ~25km
+
+REFERÊNCIA PÓRTICO: Entrando pelo pórtico da Rasa sentido Búzios, o empreendimento fica após a Vila da Rasa, na margem direita da RJ-106, antes do centro de Búzios. Região valorizada, próxima a condomínios de alto padrão.
+
+Para locais NÃO listados: informe onde fica + mande o mapa.
+NUNCA invente distância que não está na lista.
 
 ═══════════════════════════════════════════
 COMO CONVERSAR
 ═══════════════════════════════════════════
-- Bate-papo profissional — leve, direto, sem formalidade excessiva.
-- Uma pergunta por vez. Curta e objetiva.
-- Sempre termine com uma pergunta ou próximo passo claro.
+- Bate-papo profissional — leve, direto.
+- Uma pergunta por vez.
+- Sempre termine com pergunta ou próximo passo.
 - NUNCA empilhe perguntas.
-- NUNCA repita a mesma frase ou abertura em mensagens seguidas.
-- Clientes mais velhos: "o senhor" / "a senhora" com naturalidade.
+- NUNCA repita a mesma frase em mensagens seguidas.
+- Clientes mais velhos: "o senhor" / "a senhora".
 - Comentário religioso: "Amém!" / "Dia abençoado".
-- Idioma: português, mesmo que o cliente escreva em espanhol.
+- Idioma: português mesmo que o cliente escreva em espanhol.
 - Emojis com moderação (😊 🏡 👍 📍).
 
 ═══════════════════════════════════════════
 QUANDO NÃO SOUBER RESPONDER
 ═══════════════════════════════════════════
-Diga: "Deixa eu confirmar essa informação pra você! 😊" + [ALERTA]
-NUNCA invente dados, especialmente número de parcelas ou prazo de financiamento.
-Se perguntarem sobre prazo ou quantidade de parcelas: "O consultor apresenta as condições detalhadas pessoalmente — assim você já vê os lotes e tira todas as dúvidas na hora 😊"
+Apenas quando genuinamente não souber — NÃO use para localização (você tem as distâncias):
+"Deixa eu confirmar essa informação pra você! 😊" + [ALERTA]
 
 ═══════════════════════════════════════════
 AGENDAMENTO
 ═══════════════════════════════════════════
-Quando o cliente demonstrar interesse em visitar:
-"[Nome], as visitas são de terça a domingo. Qual dia funciona melhor pra você? Prefere manhã ou tarde?"
+"[Nome], as visitas são de terça a domingo. Qual dia funciona melhor? Prefere manhã ou tarde?"
 
-REGRAS DO AGENDAMENTO:
-- Se o cliente confirmar dia + período (manhã/tarde) → visita confirmada. Pare de perguntar.
-- Se o cliente confirmar só o dia (sem manhã/tarde) → também está confirmado. Não insista no período.
-- ⛔ NUNCA peça hora específica (14h, 15h, 16h, etc.). Manhã ou tarde é suficiente. NUNCA sugira uma hora ("Pode ser 15h?"). Se o cliente mencionar uma hora, aceite — mas você nunca pergunta nem sugere.
-- Quando confirmado: colete o nome completo do cliente e reforce o aviso de plantão:
-  "Só me avisa antes de ir. Meu plantão é por escala — se você chegar sem combinar comigo, outro corretor te atende e eu perco o atendimento. É só confirmar aqui que eu te garanto."
-- Quando a visita estiver confirmada (dia e nome coletados): não peça confirmação de novo.
+- Confirmou dia + período → visita confirmada. Pare de perguntar.
+- Confirmou só o dia → também confirmado.
+- ⛔ NUNCA peça hora específica.
+- Quando confirmado: colete nome completo e avise sobre o plantão por escala.
+- Visita confirmada com nome: não peça confirmação de novo.
 
 ═══════════════════════════════════════════
-DADOS DO EMPREENDIMENTO — PRAIA RASA DE BÚZIOS 2
+DADOS DO EMPREENDIMENTO
 ═══════════════════════════════════════════
-Produto único: você vende apenas este empreendimento. Nunca pergunte em que cidade ou região o cliente busca.
-
-LOCALIZAÇÃO
-- Estrada dos Búzios (RJ-106), Bairro da Rasa, divisa Búzios/Cabo Frio.
-- 800m da Praia Rasa | 3 minutos da praia | Geribá a 8km.
-- Diga sempre "próximo a Búzios". Só mencione Cabo Frio se perguntarem o endereço.
-- Link do mapa: https://www.google.com/maps/@-22.7238716,-42.001362,493m
-
-⚠️ DISTÂNCIAS — REGRA ABSOLUTA:
-Você só conhece as distâncias acima (Praia Rasa e Geribá). Para QUALQUER outra praia ou localidade que o cliente mencionar (Tucuns, Areté, João Fernandes, Ferradura, etc.), NUNCA invente uma distância nem diga que é "próximo", "pertinho" ou "ao lado". Em vez disso, informe onde o empreendimento fica e ofereça o link do mapa para ele verificar:
-"O empreendimento fica na Estrada dos Búzios (RJ-106), Bairro da Rasa. Te mando o link do mapa pra você ver a distância exata de onde você está 😊 [link do mapa]"
-Se não tiver certeza de qualquer informação geográfica: use [ALERTA].
-
 INFRAESTRUTURA
 - Condomínio fechado e murado, meio-fio instalado, rede elétrica em andamento, água em breve.
-- Guarita 24h quando a associação de moradores for fundada.
-- Playground, praça, área verde e bosque. Quadras com vista mar e vista serra.
+- Guarita 24h após fundação da associação de moradores.
+- Playground, praça, área verde, bosque. Quadras com vista mar e vista serra.
 - Próximo a condomínios de alto padrão; região de kitesurf.
-- Taxa da associação: 10% do salário mínimo, só após a entrega, já prevista em contrato.
+- Taxa da associação: 10% do salário mínimo, só após entrega, prevista em contrato.
 
 LOTES 300m²
 - Entrada R$7.000 | Parcelas a partir de R$899/mês (reajuste anual pelo IGPM).
@@ -255,33 +341,94 @@ LOTES 600m²
 - Entrada R$14.000 | Parcelas a partir de R$1.599/mês (reajuste anual pelo IGPM).
 - Vista mar: a partir de R$1.999/mês.
 
-VALOR À VISTA — nunca ofereça. Só se o cliente perguntar:
+VALOR À VISTA — nunca ofereça. Só se perguntarem:
 - 300m²: a partir de R$90.000. | 600m²: a partir de R$160.000.
 
 FINANCIAMENTO
 - Direto pela incorporadora, sem SPC/Serasa, sem banco.
 - Primeira parcela em 45 dias. Pode construir com 3 parcelas pagas.
-- Prazo: de 12 a 156 parcelas (12 anos). Se o cliente quiser pagar em menos tempo, pode escolher um prazo menor — de 12 até 156x.
-- IGPM: índice de correção anual, uma vez por ano.
-- Para simular parcelas em prazo específico ou ver tabela completa: direcione para a visita ("o consultor faz a simulação na hora").
+- Prazo: 12 a 156 parcelas (12 anos). IGPM: correção anual.
+- Simulação detalhada: direcione para a visita.
 
 DOCUMENTAÇÃO (RGI)
-"Tem RGI sim. A incorporadora está finalizando na prefeitura. Quem quitar o lote tem direito à transferência para o próprio nome — é opcional e fica por conta do cliente."
+Tem RGI. A incorporadora está finalizando na prefeitura. Transferência para o nome do comprador é opcional e por conta do cliente após quitar.
 
-VISITAS
-De terça a domingo, qualquer horário combinado. Confirme sempre dia, horário e nome. Reforce o aviso de plantão."""
+VISITAS: terça a domingo, qualquer horário combinado."""
 
+# ─── DETECÇÃO DE LEAD QUENTE ─────────────────────────────────────────────────
+HOT_LEAD_SIGNALS = [
+    'quando posso visitar', 'quero visitar', 'posso ir ver', 'quero conhecer',
+    'qual o endereço', 'como chego lá', 'tem disponível', 'ainda tem lote',
+    'quantos lotes', 'quero reservar', 'quero fechar', 'assinar', 'contrato',
+    'dou entrada', 'parcela cabe', 'consigo pagar', 'tenho interesse',
+    'estou interessado', 'quero comprar', 'vou comprar',
+]
+
+def is_hot_lead(text, history):
+    text_lower = text.lower()
+    if any(s in text_lower for s in HOT_LEAD_SIGNALS):
+        return True, "cliente demonstrou interesse direto em visita ou compra"
+    client_msgs = [m for m in history if m.get('role') == 'user']
+    if len(client_msgs) >= 5:
+        return True, f"cliente muito engajado ({len(client_msgs)} mensagens)"
+    return False, ""
+
+# ─── ALERTAS ─────────────────────────────────────────────────────────────────
+def _montar_resumo(phone, ultima_msg=""):
+    history = get_conversation(phone)
+    ultimas = history[-4:] if len(history) >= 4 else history
+    resumo  = "\n".join([
+        f"{'Cliente' if m['role']=='user' else 'Bot'}: {m['content'][:80]}"
+        for m in ultimas
+    ])
+    return resumo
+
+def send_alert(phone_client, motivo="pergunta sem resposta", ultima_msg=""):
+    resumo    = _montar_resumo(phone_client, ultima_msg)
+    alert_msg = (
+        f"⚠️ *ALERTA — Assuma a conversa!*\n\n"
+        f"📱 +{phone_client}\n"
+        f"📌 Motivo: {motivo}\n"
+        f"💬 Última msg: {ultima_msg[:100]}\n\n"
+        f"*Últimas mensagens:*\n{resumo}\n\n"
+        f"Digite qualquer coisa para o cliente para pausar o bot."
+    )
+    for number in ALERT_NUMBERS:
+        _send_raw(number, alert_msg)
+
+def send_hot_lead_alert(phone_client, motivo, ultima_msg=""):
+    resumo    = _montar_resumo(phone_client, ultima_msg)
+    alert_msg = (
+        f"🔥 *LEAD QUENTE — Entre agora!*\n\n"
+        f"📱 +{phone_client}\n"
+        f"📌 Motivo: {motivo}\n"
+        f"💬 Última msg: {ultima_msg[:100]}\n\n"
+        f"*Últimas mensagens:*\n{resumo}\n\n"
+        f"Digite qualquer coisa para o cliente para pausar o bot."
+    )
+    for number in ALERT_NUMBERS:
+        _send_raw(number, alert_msg)
 
 # ─── FUNÇÕES DE ENVIO ─────────────────────────────────────────────────────────
-
 def get_instance_token():
     return os.environ.get('INSTANCE_TOKEN', UAZAPI_TOKEN)
 
+def _send_raw(phone, text):
+    url     = f"{UAZAPI_URL}/send/text"
+    headers = {"token": get_instance_token(), "Content-Type": "application/json"}
+    data    = {"number": phone, "text": text}
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        print(f"Alert sent to {phone}: {response.status_code}")
+        return response
+    except Exception as e:
+        print(f"Error sending alert to {phone}: {e}")
+        return None
 
 def send_message(phone, text):
-    url = f"{UAZAPI_URL}/send/text"
+    url     = f"{UAZAPI_URL}/send/text"
     headers = {"token": get_instance_token(), "Content-Type": "application/json"}
-    data = {"number": phone, "text": text}
+    data    = {"number": phone, "text": text}
     try:
         response = requests.post(url, headers=headers, json=data, timeout=10)
         print(f"Text sent to {phone}: {response.status_code}")
@@ -290,10 +437,9 @@ def send_message(phone, text):
         print(f"Error sending text: {e}")
         return None
 
-
 def send_image(phone, image_url, caption=""):
     headers = {"token": get_instance_token(), "Content-Type": "application/json"}
-    data = {"number": phone, "type": "image", "file": image_url, "caption": caption}
+    data    = {"number": phone, "type": "image", "file": image_url, "caption": caption}
     try:
         response = requests.post(f"{UAZAPI_URL}/send/media", headers=headers, json=data, timeout=30)
         print(f"Image sent to {phone}: {response.status_code}")
@@ -302,10 +448,9 @@ def send_image(phone, image_url, caption=""):
         print(f"Error sending image: {e}")
         return None
 
-
 def send_video(phone, video_url, caption=""):
     headers = {"token": get_instance_token(), "Content-Type": "application/json"}
-    data = {"number": phone, "type": "video", "file": video_url, "caption": caption}
+    data    = {"number": phone, "type": "video", "file": video_url, "caption": caption}
     try:
         response = requests.post(f"{UAZAPI_URL}/send/media", headers=headers, json=data, timeout=60)
         print(f"Video sent to {phone}: {response.status_code}")
@@ -314,9 +459,7 @@ def send_video(phone, video_url, caption=""):
         print(f"Error sending video: {e}")
         return None
 
-
 def send_media_package(phone):
-    """Envia vídeos e fotos + a pergunta de reengajamento."""
     try:
         send_message(phone, "Olha só os vídeos do empreendimento 👇")
         send_video(phone, VIDEO_URL_1)
@@ -333,42 +476,30 @@ def send_media_package(phone):
     except Exception as e:
         print(f"Error in send_media_package for {phone}: {e}")
 
-
-def send_alert(phone_client):
-    alert_msg = f"⚠️ ALERTA — Cliente {phone_client} fez uma pergunta que não soube responder. Assuma a conversa!"
-    for number in ALERT_NUMBERS:
-        send_message(number, alert_msg)
-
-
 def send_and_check(phone, text):
-    resp = send_message(phone, text)
+    resp   = send_message(phone, text)
     status = getattr(resp, 'status_code', None) if resp is not None else None
     if status != 200:
-        print(f"❌ FALHA DE ENVIO para {phone} (status {status}). WhatsApp pode estar desconectado.")
+        print(f"❌ FALHA DE ENVIO para {phone} (status {status}).")
         for number in ALERT_NUMBERS:
             if number != phone:
-                send_message(number, f"⚠️ Não consegui enviar pro cliente {phone} (status {status}). "
-                                     f"Verifique se o WhatsApp está conectado na uazapi.")
+                _send_raw(number, f"⚠️ Falha ao enviar para {phone} (status {status}). Verifique o WhatsApp.")
         return False
     return True
-
 
 def notify_ai_failure(phone):
     for number in ALERT_NUMBERS:
         if number != phone:
-            send_message(number, f"⚠️ A IA falhou ao responder o cliente {phone}. "
-                                 f"Pode ser saldo da API esgotado, limite atingido ou instabilidade. Assuma a conversa!")
+            _send_raw(number, f"⚠️ IA falhou para o cliente {phone}. Assuma a conversa!")
     send_message(phone, "Oi! 😊 Só um instante que já te respondo certinho.")
 
-
 # ─── TRANSCRIÇÃO DE ÁUDIO ─────────────────────────────────────────────────────
-
 def transcribe_audio(audio_url):
     if not OPENAI_API_KEY:
         return None
     try:
         import openai
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        client   = openai.OpenAI(api_key=OPENAI_API_KEY)
         response = requests.get(audio_url, timeout=30)
         if response.status_code != 200:
             return None
@@ -385,37 +516,52 @@ def transcribe_audio(audio_url):
         print(f"Error transcribing audio: {e}")
         return None
 
-
-# ─── HELPER: extrair texto de uma mensagem ────────────────────────────────────
-
 def extract_text(message):
-    return (
+    """Extrai texto de mensagem — garante que sempre retorna string."""
+    val = (
         message.get('text') or message.get('body') or
         message.get('content') or message.get('conversation') or ''
     )
-
+    if isinstance(val, dict):
+        return val.get('text', '') or val.get('body', '') or ''
+    return str(val) if val else ''
 
 # ─── IA ───────────────────────────────────────────────────────────────────────
-
 def get_ai_response(phone, user_message):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
+    client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     history = append_message(phone, "user", user_message)
 
     import pytz
     try:
-        br_time = datetime.now(pytz.timezone("America/Sao_Paulo"))
-        hora = br_time.strftime("%H:%M")
+        br_time  = datetime.now(pytz.timezone("America/Sao_Paulo"))
         hora_int = br_time.hour
         saudacao = "Bom dia" if hora_int < 12 else ("Boa tarde" if hora_int < 18 else "Boa noite")
-        time_info = f"\n\n[Horário atual: {hora} — use '{saudacao}' apenas se for o primeiro contato]"
+        time_info = f"\n\n[Horário: {br_time.strftime('%H:%M')} — use '{saudacao}' só no primeiro contato]"
     except Exception:
         time_info = ""
 
-    system = SYSTEM_PROMPT + time_info
+    # Enriquece com distância se pergunta de localização
+    location_context = ""
+    ref = buscar_distancia_referencia(user_message)
+    if ref:
+        location_context = (
+            f"\n\n[LOCALIZAÇÃO CONFIRMADA: '{ref['desc']}' fica a ~{ref['dist_km']}km do empreendimento. "
+            f"Use essa informação diretamente na resposta.]"
+        )
+    elif any(kw in user_message.lower() for kw in ['fica', 'onde', 'distância', 'longe', 'perto', 'km', 'minutos', 'localiz']):
+        palavras = user_message.split()
+        for i, p in enumerate(palavras):
+            if len(p) > 4:
+                dist = buscar_distancia_osm(' '.join(palavras[max(0, i-1):i+2]))
+                if dist:
+                    location_context = (
+                        f"\n\n[DISTÂNCIA CALCULADA via mapa: ~{dist}km até o local mencionado. "
+                        f"Use se relevante para a resposta.]"
+                    )
+                    break
 
-    # HISTORY_LIMIT reduzido de 20 para 8 — economia de ~60% nos tokens de entrada
-    last_msgs = history[-HISTORY_LIMIT:]
+    system     = SYSTEM_PROMPT + time_info + location_context
+    last_msgs  = history[-HISTORY_LIMIT:]
     api_messages = [
         {"role": "user",      "content": "Olá"},
         {"role": "assistant", "content": GREETING},
@@ -423,13 +569,10 @@ def get_ai_response(phone, user_message):
 
     try:
         response = client.messages.create(
-            model=AI_MODEL,
-            max_tokens=600,
-            system=system,
-            messages=api_messages
+            model=AI_MODEL, max_tokens=600, system=system, messages=api_messages
         )
     except Exception as e:
-        print(f"❌ ERRO NA IA (Anthropic) para {phone}: {e}")
+        print(f"❌ ERRO NA IA para {phone}: {e}")
         return None, False, False
 
     reply_raw   = response.content[0].text
@@ -437,71 +580,48 @@ def get_ai_response(phone, user_message):
     media_flag  = '[ENVIAR_MIDIA]' in reply_raw
     reply_clean = reply_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
 
-    if media_flag:
-        hist_text = reply_clean + "\n[Enviei as fotos e vídeos do empreendimento e perguntei: O que achou?]"
-    else:
-        hist_text = reply_clean
+    hist_text = reply_clean + ("\n[Enviei fotos e vídeos e perguntei: O que achou?]" if media_flag else "")
     append_message(phone, "assistant", hist_text)
 
     return reply_clean, alert_flag, media_flag
 
-
-# ─── FOLLOW-UP (REENGAJAMENTO QUANDO O CLIENTE SOME) ──────────────────────────
-
+# ─── FOLLOW-UP ───────────────────────────────────────────────────────────────
 def generate_followup(phone, stage):
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         history = get_conversation(phone)
         situ = {
-            1: "O cliente parou de responder há poucos minutos. Mande UMA mensagem curta e leve pra retomar de onde parou, sem cobrar. Termine com uma pergunta fácil de responder.",
-            2: "O cliente está sem responder há cerca de 1 hora. Mande uma mensagem calorosa com uma pergunta NOVA pra reengajar e puxar a visita ao empreendimento. Não repita o que já foi dito.",
-            3: "É o fim do dia e o cliente não voltou. Mande uma última mensagem do dia, simpática e sem pressão, reforçando o convite pra conhecer pessoalmente e deixando a porta aberta pra ele responder quando puder.",
+            1: "O cliente parou de responder há poucos minutos. Mande UMA mensagem curta e leve pra retomar, sem cobrar.",
+            2: "Sem resposta há ~1 hora. Mensagem calorosa com pergunta NOVA pra reengajar.",
+            3: "Fim do dia. Última mensagem simpática, sem pressão, porta aberta.",
         }
-        system = SYSTEM_PROMPT + (
-            f"\n\n[VOCÊ ESTÁ RETOMANDO O CONTATO com um cliente que parou de responder. "
-            f"{situ.get(stage, situ[1])} Gere SÓ a mensagem, curta e natural. "
-            f"NÃO cumprimente de novo — a conversa já está em andamento.]"
-        )
-        # Histórico reduzido também no follow-up
+        system    = SYSTEM_PROMPT + f"\n\n[RETOMANDO CONTATO: {situ.get(stage, situ[1])} Gere SÓ a mensagem, curta e natural. NÃO cumprimente de novo.]"
         last_msgs = history[-HISTORY_LIMIT:]
         api_messages = [
             {"role": "user",      "content": "Olá"},
             {"role": "assistant", "content": GREETING},
         ] + last_msgs + [
-            {"role": "user", "content": "[O cliente ficou em silêncio. Escreva agora a mensagem de retomada, seguindo a instrução.]"}
+            {"role": "user", "content": "[Cliente ficou em silêncio. Escreva a mensagem de retomada.]"}
         ]
-        response = client.messages.create(
-            model=AI_MODEL,
-            max_tokens=300,
-            system=system,
-            messages=api_messages
-        )
-        msg = response.content[0].text
+        response = client.messages.create(model=AI_MODEL, max_tokens=300, system=system, messages=api_messages)
+        msg      = response.content[0].text
         return msg.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
     except Exception as e:
         print(f"generate_followup error ({phone}): {e}")
         return None
 
-
 FOLLOWUP_STOP_SIGNALS = [
     "tá anotado", "tá confirmado", "agendado pra", "nos vemos",
     "até terça", "até segunda", "até quarta", "até quinta",
     "até sexta", "até sábado", "até domingo", "te espero lá",
-    "já tá anotado", "perfeito! terça", "perfeito! sábado",
     "terça às", "sábado às", "domingo às", "segunda às",
-    "quinta à tarde", "quinta de manhã", "quarta à tarde", "quarta de manhã",
-    "sábado à tarde", "sábado de manhã", "domingo à tarde", "domingo de manhã",
-    "segunda à tarde", "segunda de manhã", "terça à tarde", "terça de manhã",
-    "sexta à tarde", "sexta de manhã",
     "show, quinta", "show, quarta", "show, terça", "show, sábado",
-    "show, sexta", "show, domingo", "show, segunda",
     "fechado,", "fechado!", "✅", "te espero", "até lá",
 ]
 
 def is_duplicate_msg(message, phone=''):
     r = get_redis()
-    if not r:
-        return False
+    if not r: return False
     try:
         msg_id = (
             message.get('id') or
@@ -509,11 +629,10 @@ def is_duplicate_msg(message, phone=''):
             (message.get('key') or {}).get('id', '') or
             message.get('remoteJid', '') + str(message.get('timestamp', ''))
         )
-        if not msg_id:
-            return False
+        if not msg_id: return False
         key = f"dup:{msg_id}"
         if r.exists(key):
-            print(f"🔁 Mensagem duplicada ignorada: {msg_id[:30]}")
+            print(f"🔁 Duplicata ignorada: {msg_id[:30]}")
             return True
         r.setex(key, 120, phone or "unknown")
         return False
@@ -521,11 +640,9 @@ def is_duplicate_msg(message, phone=''):
         print(f"Dedup error: {e}")
         return False
 
-
 def get_phone_from_msg_id(message):
     r = get_redis()
-    if not r:
-        return ''
+    if not r: return ''
     try:
         msg_id = (
             message.get('id') or
@@ -533,26 +650,20 @@ def get_phone_from_msg_id(message):
             (message.get('key') or {}).get('id', '') or
             message.get('remoteJid', '') + str(message.get('timestamp', ''))
         )
-        if not msg_id:
-            return ''
+        if not msg_id: return ''
         cached = r.get(f"dup:{msg_id}")
         return cached if cached and cached != 'unknown' else ''
     except Exception as e:
         print(f"get_phone_from_msg_id error: {e}")
         return ''
 
-
 def is_visit_confirmed(history):
     assistant_texts = " ".join(
-        m.get("content", "").lower()
-        for m in history[-10:]
-        if m.get("role") == "assistant"
+        m.get("content", "").lower() for m in history[-10:] if m.get("role") == "assistant"
     )
     return any(s in assistant_texts for s in FOLLOWUP_STOP_SIGNALS)
 
-
-# ─── GOOGLE CALENDAR + LEMBRETE DE VISITA ────────────────────────────────────
-
+# ─── GOOGLE CALENDAR ─────────────────────────────────────────────────────────
 CALENDAR_ID = os.environ.get('GOOGLE_CALENDAR_ID', 'evelinbaiense@gmail.com')
 
 def get_calendar_service():
@@ -560,70 +671,54 @@ def get_calendar_service():
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
         creds_json = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
-        if not creds_json:
-            return None
-        creds_data = json.loads(creds_json)
+        if not creds_json: return None
         credentials = service_account.Credentials.from_service_account_info(
-            creds_data, scopes=['https://www.googleapis.com/auth/calendar']
+            json.loads(creds_json), scopes=['https://www.googleapis.com/auth/calendar']
         )
         return build('calendar', 'v3', credentials=credentials)
     except Exception as e:
         print(f"Calendar service error: {e}")
         return None
 
-
 def next_weekday_date(day_name):
-    days_map = {
-        'segunda': 0, 'terça': 1, 'terca': 1, 'quarta': 2,
-        'quinta': 3, 'sexta': 4, 'sábado': 5, 'sabado': 5, 'domingo': 6
-    }
-    target = None
+    days_map = {'segunda': 0, 'terça': 1, 'terca': 1, 'quarta': 2, 'quinta': 3, 'sexta': 4, 'sábado': 5, 'sabado': 5, 'domingo': 6}
+    target   = None
     for name, num in days_map.items():
         if name in day_name.lower():
             target = num
             break
-    if target is None:
-        return None
+    if target is None: return None
     try:
         import pytz
         from datetime import timedelta
-        tz = pytz.timezone('America/Sao_Paulo')
-        today = datetime.now(tz).date()
+        tz         = pytz.timezone('America/Sao_Paulo')
+        today      = datetime.now(tz).date()
         days_ahead = target - today.weekday()
-        if days_ahead <= 0:
-            days_ahead += 7
+        if days_ahead <= 0: days_ahead += 7
         return (today + timedelta(days=days_ahead)).isoformat()
     except Exception:
         return None
 
-
 def extract_and_save_visit(phone, history):
     r = get_redis()
-    if not r:
-        return
-    if r.exists(f"visit:{phone}"):
-        return
+    if not r: return
+    if r.exists(f"visit:{phone}"): return
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        client      = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         recent_text = json.dumps(history[-12:], ensure_ascii=False)
-        response = client.messages.create(
-            model=AI_MODEL,
-            max_tokens=150,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Analise esta conversa e extraia os dados da visita agendada. "
-                    "Responda APENAS em JSON válido, sem texto adicional:\n"
-                    '{"name": "nome do cliente", "day": "dia da semana em português", '
-                    '"period": "manhã, tarde, ou desconhecido"}\n\n'
-                    f"Conversa:\n{recent_text}"
-                )
-            }]
+        response    = client.messages.create(
+            model=AI_MODEL, max_tokens=150,
+            messages=[{"role": "user", "content": (
+                "Analise esta conversa e extraia os dados da visita agendada. "
+                "Responda APENAS em JSON válido:\n"
+                '{"name": "nome do cliente", "day": "dia da semana em português", "period": "manhã, tarde, ou desconhecido"}\n\n'
+                f"Conversa:\n{recent_text}"
+            )}]
         )
-        data = json.loads(response.content[0].text.strip())
-        name = data.get('name', 'Cliente')
-        day = data.get('day', '')
-        period = data.get('period', 'desconhecido')
+        data       = json.loads(response.content[0].text.strip())
+        name       = data.get('name', 'Cliente')
+        day        = data.get('day', '')
+        period     = data.get('period', 'desconhecido')
         visit_date = next_weekday_date(day) if day else None
         visit_info = {'name': name, 'phone': phone, 'day': day, 'period': period, 'date': visit_date}
         r.setex(f"visit:{phone}", 30 * 24 * 3600, json.dumps(visit_info))
@@ -633,111 +728,92 @@ def extract_and_save_visit(phone, history):
             if service:
                 period_label = f" ({period})" if period != 'desconhecido' else ''
                 event = {
-                    'summary': f'Visita — {name}{period_label}',
-                    'location': 'Estrada dos Búzios (RJ-106), Bairro da Rasa',
+                    'summary':     f'Visita — {name}{period_label}',
+                    'location':    'Estrada dos Búzios (RJ-106), Bairro da Rasa',
                     'description': f'WhatsApp: +{phone}\nPeríodo: {period}',
-                    'start': {'date': visit_date, 'timeZone': 'America/Sao_Paulo'},
-                    'end':   {'date': visit_date, 'timeZone': 'America/Sao_Paulo'},
+                    'start':       {'date': visit_date, 'timeZone': 'America/Sao_Paulo'},
+                    'end':         {'date': visit_date, 'timeZone': 'America/Sao_Paulo'},
                 }
                 service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-                print(f"📅 Google Calendar: evento criado para {name} em {visit_date}")
+                print(f"📅 Calendar: {name} em {visit_date}")
     except Exception as e:
         print(f"extract_and_save_visit error ({phone}): {e}")
 
-
 def visit_reminder_sweep():
     r = get_redis()
-    if not r:
-        return
+    if not r: return
     try:
         import pytz
         from datetime import timedelta
-        tz = pytz.timezone('America/Sao_Paulo')
+        tz  = pytz.timezone('America/Sao_Paulo')
         now = datetime.now(tz)
-        if now.hour != 8:
-            return
+        if now.hour != 8: return
         tomorrow = (now.date() + timedelta(days=1)).isoformat()
         for key in r.scan_iter("visit:*"):
             phone_num = key.split("visit:", 1)[1]
-            data_raw = r.get(key)
-            if not data_raw:
-                continue
+            data_raw  = r.get(key)
+            if not data_raw: continue
             visit = json.loads(data_raw)
             if visit.get('date') == tomorrow:
-                name = visit.get('name', 'Cliente')
-                period = visit.get('period', '')
+                name       = visit.get('name', 'Cliente')
+                period     = visit.get('period', '')
                 period_txt = f" — {period}" if period not in ('desconhecido', '') else ''
                 msg = (
                     f"🗓️ *Visita amanhã!*\n\n"
-                    f"👤 {name}\n"
-                    f"📱 +{phone_num}\n"
-                    f"📅 {visit.get('day', '').capitalize()}{period_txt}\n"
+                    f"👤 {name}\n📱 +{phone_num}\n"
+                    f"📅 {visit.get('day','').capitalize()}{period_txt}\n"
                     f"📍 Praia Rasa de Búzios 2\n\n"
                     f"Confirme com o cliente antes de ir! 😊"
                 )
                 for alert_num in ALERT_NUMBERS:
-                    send_message(alert_num, msg)
-                print(f"🔔 Lembrete enviado: visita de {name} amanhã")
+                    _send_raw(alert_num, msg)
+                print(f"🔔 Lembrete: {name} amanhã")
     except Exception as e:
         print(f"visit_reminder_sweep error: {e}")
 
-
 def followup_sweep():
-    if not FOLLOWUP_ENABLED:
-        return
+    if not FOLLOWUP_ENABLED: return
     r = get_redis()
-    if not r:
-        return
+    if not r: return
     try:
         import pytz
         hora = datetime.now(pytz.timezone("America/Sao_Paulo")).hour
     except Exception:
         hora = 12
-    if not (FOLLOWUP_DAY_START <= hora < FOLLOWUP_DAY_END):
-        return
+    if not (FOLLOWUP_DAY_START <= hora < FOLLOWUP_DAY_END): return
     now = time.time()
     try:
         for key in r.scan_iter("fu:*"):
             phone = key.split("fu:", 1)[1]
-            if is_paused(phone):
-                continue
+            if is_paused(phone): continue
             state = get_followup_state(phone)
-            if not state:
-                continue
+            if not state: continue
             stage = state.get("stage", 0)
-            if stage >= 3:
-                continue
+            if stage >= 3: continue
             silent_min = (now - state.get("last_client_ts", now)) / 60.0
-            history = get_conversation(phone)
-            if not history or history[-1].get("role") != "assistant":
-                continue
+            history    = get_conversation(phone)
+            if not history or history[-1].get("role") != "assistant": continue
             if is_visit_confirmed(history):
                 extract_and_save_visit(phone, history)
                 state["stage"] = 3
                 set_followup_state(phone, state)
                 continue
             next_stage = None
-            if stage == 0 and silent_min >= FOLLOWUP_STAGE1_MIN:
-                next_stage = 1
-            elif stage == 1 and silent_min >= FOLLOWUP_STAGE2_MIN:
-                next_stage = 2
-            elif stage == 2 and silent_min >= FOLLOWUP_STAGE3_MIN and hora >= 18:
-                next_stage = 3
-            if not next_stage:
-                continue
+            if   stage == 0 and silent_min >= FOLLOWUP_STAGE1_MIN: next_stage = 1
+            elif stage == 1 and silent_min >= FOLLOWUP_STAGE2_MIN: next_stage = 2
+            elif stage == 2 and silent_min >= FOLLOWUP_STAGE3_MIN and hora >= 18: next_stage = 3
+            if not next_stage: continue
             msg = generate_followup(phone, next_stage)
             if msg:
                 if send_and_check(phone, msg):
                     append_message(phone, "assistant", msg)
                 state["stage"] = next_stage
                 set_followup_state(phone, state)
-                print(f"📨 Follow-up estágio {next_stage} enviado para {phone}")
+                print(f"📨 Follow-up estágio {next_stage} para {phone}")
     except Exception as e:
         print(f"followup_sweep error: {e}")
 
-
 # ─── WEBHOOK ──────────────────────────────────────────────────────────────────
-
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
@@ -748,43 +824,48 @@ def webhook():
             return jsonify({'status': 'no_data'}), 200
 
         message = data.get('message', {})
-        if not message:
+        if not message or not isinstance(message, dict):
             return jsonify({'status': 'no_message'}), 200
 
         if message.get('isGroup', False):
             return jsonify({'status': 'group'}), 200
 
+        # Ignora atualizações, edições e tipos não-mensagem
+        msg_type = message.get('type', '') or message.get('messageType', '')
         if (message.get('isEdit') or message.get('updateType') or
-                message.get('messageType', '') in ('messageUpdate', 'editedMessage')):
-            return jsonify({'status': 'edit_ignored'}), 200
+                msg_type in ('messageUpdate', 'editedMessage', 'protocolMessage',
+                             'reactionMessage', 'senderKeyDistributionMessage',
+                             'messageContextInfo', 'statusUpdate')):
+            return jsonify({'status': 'ignored'}), 200
 
-        from_me = message.get('fromMe', False)
-        is_api  = message.get('wasSentByApi', False)
+        from_me    = message.get('fromMe', False)
+        is_api     = message.get('wasSentByApi', False)
+        media_type = message.get('mediaType', '')
 
         convo = message.get('chatId', '') or message.get('sender_pn', '')
         phone = convo.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('@lid', '')
-
         if not phone:
             return jsonify({'status': 'no_phone'}), 200
 
-        msg_type   = message.get('type', '') or message.get('messageType', '')
-        media_type = message.get('mediaType', '')
-
-        # ───────────────────────────────────────────────────────────────────
-        # 1) MENSAGEM ENVIADA PELO PRÓPRIO WHATSAPP (fromMe) — ANTES do dedup
-        # ───────────────────────────────────────────────────────────────────
+        # ── 1) MENSAGEM ENVIADA POR VOCÊ (fromMe) ───────────────────────────
         if from_me:
             if is_api:
                 return jsonify({'status': 'from_bot'}), 200
 
+            raw_text = extract_text(message)
+
+            # Ignora saudação automática do Facebook
+            if any(kw in raw_text.lower() for kw in FB_AUTO_GREETING_KEYWORDS):
+                print(f"[FB_AUTO] Saudação automática ignorada")
+                return jsonify({'status': 'fb_auto_ignored'}), 200
+
             pause_phone = get_phone_from_msg_id(message)
             if not pause_phone:
-                chat_data = data.get('chat', {})
-                raw = (chat_data.get('phone', '') or chat_data.get('jid', '') or
-                       chat_data.get('chatId', '')) if isinstance(chat_data, dict) else ''
+                chat_data   = data.get('chat', {})
+                raw         = (chat_data.get('phone', '') or chat_data.get('jid', '') or chat_data.get('chatId', '')) if isinstance(chat_data, dict) else ''
                 pause_phone = raw.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('+', '') if raw else phone
 
-            manual_text = extract_text(message).strip()
+            manual_text = raw_text.strip()
             print(f"[MANUAL] Você digitou para {pause_phone}: '{manual_text[:40]}'")
 
             if manual_text == RESUME_KEYWORD:
@@ -796,44 +877,35 @@ def webhook():
                 append_message(pause_phone, "assistant", manual_text)
             return jsonify({'status': 'paused_human_takeover'}), 200
 
-        # Proteção contra duplicatas (só para mensagens de clientes)
+        # ── Dedup ────────────────────────────────────────────────────────────
         if is_duplicate_msg(message, phone):
             return jsonify({'status': 'duplicate'}), 200
 
-        # ── Define text_cmd AQUI, antes de qualquer verificação de comando ──
         text_cmd = extract_text(message).strip()
 
-        # Comandos de pausa/retomada manual
-        if text_cmd.lower() == '//.' :
+        if text_cmd.lower() == '//.':
             set_pause(phone)
-            print(f"[PAUSE] {phone} pausado via //.")
             return jsonify({'status': 'paused_by_command'}), 200
 
         if text_cmd == RESUME_KEYWORD:
             clear_pause(phone)
-            print(f"[RESUME] {phone} retomado via '.'")
             return jsonify({'status': 'resumed'}), 200
 
-        # ───────────────────────────────────────────────────────────────────
-        # 2) MENSAGEM DO CLIENTE — se a conversa está pausada, NÃO responde
-        # ───────────────────────────────────────────────────────────────────
+        # ── 2) BOT PAUSADO ───────────────────────────────────────────────────
         if is_paused(phone):
-            txt = extract_text(message).strip()
-            if txt:
-                append_message(phone, "user", txt)
-            print(f"⏸️  {phone} está em atendimento humano — bot não respondeu.")
+            if text_cmd:
+                append_message(phone, "user", text_cmd)
+            print(f"⏸️  {phone} em atendimento humano.")
             return jsonify({'status': 'paused_no_reply'}), 200
 
-        # ───────────────────────────────────────────────────────────────────
-        # 3) FLUXO NORMAL DO BOT
-        # ───────────────────────────────────────────────────────────────────
+        # ── 3) FLUXO NORMAL ──────────────────────────────────────────────────
         set_followup_state(phone, {"last_client_ts": time.time(), "stage": 0})
 
         text = ""
 
-        # Áudio
-        is_audio = msg_type in ('audio', 'ptt', 'audioMessage', 'PTT')
+        is_audio       = msg_type in ('audio', 'ptt', 'audioMessage', 'PTT')
         is_media_audio = msg_type == 'media' and media_type not in ('image', 'video', 'document', 'sticker')
+
         if is_audio or is_media_audio:
             raw = (
                 message.get('url') or message.get('mediaUrl') or
@@ -860,17 +932,15 @@ def webhook():
             if audio_url:
                 text = transcribe_audio(audio_url)
                 if not text:
-                    send_message(phone, "Oi! 😊 Não consegui ouvir o áudio. Pode me mandar por texto que te respondo na hora!")
+                    send_message(phone, "Oi! 😊 Não consegui ouvir o áudio. Pode me mandar por texto?")
                     return jsonify({'status': 'ok'}), 200
             else:
-                send_message(phone, "Oi! 😊 Não consegui ouvir o áudio. Pode me mandar por texto que te respondo na hora!")
+                send_message(phone, "Oi! 😊 Não consegui ouvir o áudio. Pode me mandar por texto?")
                 return jsonify({'status': 'ok'}), 200
 
-        # Texto
         elif msg_type in ('text', 'Conversation', 'extendedTextMessage'):
-            text = extract_text(message).strip()
+            text = text_cmd
 
-        # Cliente enviou imagem/vídeo
         elif msg_type == 'media' and media_type in ('image', 'video', 'sticker', 'document'):
             reply, alert_flag, media_flag = get_ai_response(phone, "[cliente enviou uma imagem]")
             if reply is None:
@@ -878,7 +948,7 @@ def webhook():
                 return jsonify({'status': 'ai_error'}), 200
             send_and_check(phone, reply)
             if alert_flag:
-                send_alert(phone)
+                threading.Thread(target=send_alert, args=(phone, "pergunta sem resposta", "[imagem]"), daemon=True).start()
             if media_flag:
                 threading.Thread(target=send_media_package, args=(phone,)).start()
             return jsonify({'status': 'ok'}), 200
@@ -891,33 +961,38 @@ def webhook():
 
         print(f"phone='{phone}', text='{text[:80]}'")
 
+        # Detecta lead quente ANTES de chamar a IA
+        history_atual   = get_conversation(phone)
+        hot, hot_motivo = is_hot_lead(text, history_atual)
+
         reply, alert_flag, media_flag = get_ai_response(phone, text)
         if reply is None:
             notify_ai_failure(phone)
             return jsonify({'status': 'ai_error'}), 200
 
-        # Rede de segurança: cliente aceitou ver mídia mas modelo não emitiu a tag
+        # Rede de segurança para mídia
         if not media_flag:
             media_keywords = ['quero ver', 'queria ver', 'pode mandar', 'manda sim',
                               'com certeza', 'claro que sim', 'quero as fotos',
                               'foto', 'fotos', 'video', 'vídeo', 'videos', 'vídeos']
-            history = get_conversation(phone)
-            last_bot = next((m['content'] for m in reversed(history[:-1])
-                             if m['role'] == 'assistant'), '')
+            history_now = get_conversation(phone)
+            last_bot    = next((m['content'] for m in reversed(history_now[:-1]) if m['role'] == 'assistant'), '')
             if (any(kw in text.lower() for kw in media_keywords) and
                     any(kw in last_bot.lower() for kw in ['foto', 'vídeo', 'video', 'imagens', 'mandar'])):
                 media_flag = True
 
-        print(f"Sending reply: {reply[:80]}")
         send_and_check(phone, reply)
 
+        # Alertas em thread — não atrasa a resposta ao cliente
         if alert_flag:
-            send_alert(phone)
+            threading.Thread(target=send_alert, args=(phone, "pergunta sem resposta", text), daemon=True).start()
+        elif hot:
+            threading.Thread(target=send_hot_lead_alert, args=(phone, hot_motivo, text), daemon=True).start()
 
         if media_flag:
             threading.Thread(target=send_media_package, args=(phone,)).start()
 
-        # Detecção imediata de visita confirmada → agenda no Google Calendar
+        # Detecta visita confirmada
         updated_history = get_conversation(phone)
         if is_visit_confirmed(updated_history):
             threading.Thread(target=extract_and_save_visit, args=(phone, updated_history), daemon=True).start()
@@ -930,12 +1005,9 @@ def webhook():
         traceback.print_exc()
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-
 # ─── RECOVERY ─────────────────────────────────────────────────────────────────
-
 recovery_contacts = []
-recovery_index = 0
-
+recovery_index    = 0
 
 def load_recovery_contacts():
     global recovery_contacts
@@ -947,16 +1019,15 @@ def load_recovery_contacts():
     except Exception as e:
         print(f"Error loading recovery contacts: {e}")
 
-
 def send_recovery_message():
     global recovery_index, recovery_contacts
     load_recovery_contacts()
     if not recovery_contacts or recovery_index >= len(recovery_contacts):
         recovery_index = 0
         return
-    contact = recovery_contacts[recovery_index]
-    phone = contact.get('telefone', '').replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
-    name  = contact.get('nome', '')
+    contact    = recovery_contacts[recovery_index]
+    phone      = contact.get('telefone', '').replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+    name       = contact.get('nome', '')
     custom_msg = contact.get('mensagem', '')
     if not phone:
         recovery_index += 1
@@ -964,62 +1035,55 @@ def send_recovery_message():
     if is_paused(phone):
         recovery_index += 1
         return
-    message = custom_msg or f"Oi{' ' + name if name else ''}! Aqui é a Evelin 😊 Ainda temos algumas unidades no Praia Rasa de Búzios 2 — e as últimas estão saindo rápido. Você ainda tem interesse? Me avisa antes de visitar que garanto seu atendimento!"
+    message = custom_msg or f"Oi{' ' + name if name else ''}! Aqui é a Evelin 😊 Ainda temos algumas unidades no Praia Rasa de Búzios 2 — e as últimas estão saindo rápido. Você ainda tem interesse?"
     send_message(phone, message)
     recovery_index += 1
 
-
 # ─── ROTAS ────────────────────────────────────────────────────────────────────
-
 @app.route('/health', methods=['GET'])
 def health():
-    r = get_redis()
+    r        = get_redis()
     redis_ok = False
     if r:
         try:
             r.ping()
             redis_ok = True
         except Exception:
-            redis_ok = False
+            pass
     return jsonify({
-        'status': 'running',
-        'redis': 'ok' if redis_ok else 'OFFLINE',
-        'memory_enabled': redis_ok,
-        'model': AI_MODEL,
+        'status':        'running',
+        'redis':         'ok' if redis_ok else 'OFFLINE',
+        'model':         AI_MODEL,
         'history_limit': HISTORY_LIMIT,
-        'timestamp': datetime.now().isoformat()
+        'timestamp':     datetime.now().isoformat()
     }), 200
-
 
 @app.route('/pause/<path:phone>', methods=['GET'])
 def pause_toggle(phone):
-    key = request.args.get('key', '')
+    key       = request.args.get('key', '')
     admin_key = os.environ.get('ADMIN_KEY', '')
     if not admin_key or key != admin_key:
         return 'Chave incorreta.', 403
     phone_clean = phone.replace('+', '').replace('-', '').replace(' ', '')
     if is_paused(phone_clean):
         clear_pause(phone_clean)
-        return f'▶️ Bot RETOMADO para {phone_clean}. Ele voltará a responder normalmente.', 200
+        return f'▶️ Bot RETOMADO para {phone_clean}.', 200
     else:
         set_pause(phone_clean)
-        return f'⏸️ Bot PAUSADO para {phone_clean}. Ele ficará mudo por 12h (ou até você acessar esta URL de novo).', 200
-
+        return f'⏸️ Bot PAUSADO para {phone_clean} por 12h.', 200
 
 @app.route('/recovery/start', methods=['POST'])
 def start_recovery():
     load_recovery_contacts()
     return jsonify({'status': 'ok', 'contacts': len(recovery_contacts)}), 200
 
-
 # ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
-
 if __name__ == '__main__':
     get_redis()
     scheduler = BackgroundScheduler()
     scheduler.add_job(send_recovery_message, 'interval', hours=RECOVERY_INTERVAL_HOURS)
-    scheduler.add_job(followup_sweep, 'interval', minutes=FOLLOWUP_CHECK_MIN)
-    scheduler.add_job(visit_reminder_sweep, 'interval', minutes=30)
+    scheduler.add_job(followup_sweep,        'interval', minutes=FOLLOWUP_CHECK_MIN)
+    scheduler.add_job(visit_reminder_sweep,  'interval', minutes=30)
     scheduler.start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
