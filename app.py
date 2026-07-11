@@ -31,9 +31,10 @@ MAX_TOKENS_FOLLOWUP = int(os.environ.get('MAX_TOKENS_FOLLOWUP', '1000'))
 MAX_TOKENS_EXTRACT  = int(os.environ.get('MAX_TOKENS_EXTRACT', '500'))
 
 # ─── TRAVA DE PAUSA ──────────────────────────────────────────────────────────
-RESUME_KEYWORD      = '.'
-PAUSE_TTL           = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
-PAUSE_GUARD_SECONDS = float(os.environ.get('PAUSE_GUARD_SECONDS', '5'))
+RESUME_KEYWORD         = '.'
+PAUSE_TTL              = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
+PAUSE_GUARD_SECONDS    = float(os.environ.get('PAUSE_GUARD_SECONDS', '5'))
+MANUAL_ACTIVITY_WINDOW = int(os.environ.get('MANUAL_ACTIVITY_WINDOW', '120'))
 
 # ─── FOLLOW-UP ───────────────────────────────────────────────────────────────
 FOLLOWUP_ENABLED    = os.environ.get('FOLLOWUP_ENABLED', 'true').lower() == 'true'
@@ -244,6 +245,25 @@ def should_send_hot_lead_alert(phone):
         print(f"Redis should_send_hot_lead_alert error ({phone}): {e}")
         return True
 
+def mark_manual_activity(phone):
+    """Marca que houve mensagem manual (fromMe) recente nesse número — usado para
+    decidir se vale a pena aplicar o atraso de segurança antes do próximo envio."""
+    r = get_redis()
+    if not r: return
+    try:
+        r.setex(f"manual_activity:{phone}", MANUAL_ACTIVITY_WINDOW, "1")
+    except Exception as e:
+        print(f"Redis mark_manual_activity error ({phone}): {e}")
+
+def had_recent_manual_activity(phone):
+    r = get_redis()
+    if not r: return False
+    try:
+        return r.exists(f"manual_activity:{phone}") == 1
+    except Exception as e:
+        print(f"Redis had_recent_manual_activity error ({phone}): {e}")
+        return False
+
 # ─── MÍDIAS ──────────────────────────────────────────────────────────────────
 PHOTOS = [
     "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-01-pergola_kcvsxw.jpg",
@@ -266,6 +286,19 @@ SYSTEM_PROMPT = """Você é Evelin Abreu, corretora de imóveis do Praia Rasa de
 REGRA ABSOLUTA: RESPONDA A PERGUNTA PRIMEIRO
 ═══════════════════════════════════════════
 Se o cliente fizer qualquer pergunta direta — localização, preço, documentação, infraestrutura — RESPONDA PRIMEIRO. Só depois avance no fluxo. NUNCA ignore uma pergunta para seguir o script.
+
+═══════════════════════════════════════════
+GUIE A CONVERSA COMO UMA VENDEDORA EXPERIENTE
+═══════════════════════════════════════════
+- Você não está só respondendo perguntas — está conduzindo o cliente até a
+  visita. Toda resposta deve avançar a conversa para o próximo passo natural
+  (localização → valores → visita), nunca deixar a conversa "morrer" sem rumo.
+- Use técnica de venda: gere interesse antes de detalhar tudo de uma vez,
+  crie senso de oportunidade quando fizer sentido, e sempre guie o cliente
+  a responder e dar o próximo passo — não apenas informe e pare.
+- Isso NÃO significa perguntar sobre visita a cada mensagem (ver PASSO 5) —
+  significa que cada resposta sua tem direção clara, incentivando o cliente
+  a continuar engajado, nunca uma resposta que só informa e encerra o assunto.
 
 ═══════════════════════════════════════════
 DETECTE O PERFIL DO CLIENTE E ADAPTE
@@ -320,7 +353,11 @@ PASSO 4 — Valores (se ele não perguntou antes):
 Se sim: apresente 300m² e 600m² com PARCELAS.
 ⚠️ NUNCA mencione valor à vista por iniciativa. Só se perguntarem.
 
-PASSO 5 — Visita.
+PASSO 5 — Visita: seu objetivo final é levar o cliente a agendar uma visita, mas
+NÃO pergunte sobre visita em toda mensagem. Só traga o assunto quando o cliente
+der uma brecha — perguntar disponibilidade, dizer que quer conhecer, reagir bem
+depois de ver fotos/valores, ou você perceber que já passou por localização e
+valores sem objeção. Depois de perguntar uma vez, não repita insistentemente.
 
 ═══════════════════════════════════════════
 LOCALIZAÇÃO — RESPOSTAS PRONTAS
@@ -413,6 +450,10 @@ Apenas quando genuinamente não souber — NÃO use para localização (você te
 ═══════════════════════════════════════════
 AGENDAMENTO
 ═══════════════════════════════════════════
+Só use isto quando o cliente já deu uma brecha (ver PASSO 5). Não ofereça visita
+por conta própria em toda mensagem — o objetivo é chegar lá naturalmente, não
+insistir.
+
 "[Nome], as visitas são de terça a domingo. Qual dia funciona melhor? Prefere manhã ou tarde?"
 
 - Confirmou dia + período → confirmado. Pare de perguntar.
@@ -424,11 +465,15 @@ AGENDAMENTO
 ═══════════════════════════════════════════
 DADOS DO EMPREENDIMENTO
 ═══════════════════════════════════════════
+⚠️ Este é um LOTEAMENTO FECHADO (venda de lotes de terreno) — NUNCA chame o
+empreendimento de "condomínio". "Condomínio" só se aplica aos empreendimentos
+vizinhos, que são de terceiros.
+
 INFRAESTRUTURA
-- Condomínio fechado e murado, meio-fio instalado, rede elétrica em andamento, água em breve.
+- Loteamento fechado e murado, meio-fio instalado, rede elétrica em andamento, água em breve.
 - Guarita 24h após fundação da associação de moradores.
 - Playground, praça, área verde, bosque. Quadras com vista mar e vista serra.
-- Próximo a condomínios de alto padrão; região de kitesurf.
+- Próximo a condomínios de alto padrão (empreendimentos vizinhos); região de kitesurf.
 - Taxa da associação: 10% do salário mínimo, só após entrega, prevista em contrato.
 
 LOTES 300m²
@@ -445,7 +490,8 @@ VALOR À VISTA — nunca ofereça. Só se perguntarem:
 FINANCIAMENTO
 - Direto pela incorporadora, sem SPC/Serasa, sem banco.
 - Primeira parcela em 45 dias. Pode construir com 3 parcelas pagas.
-- Prazo: 12 a 156 parcelas (12 anos). IGPM: correção anual.
+- Prazo: de 12 até 156 parcelas (até 13 anos). O prazo MÁXIMO é 156 parcelas —
+  nunca informe outro número no lugar desse. IGPM: correção anual.
 - Simulação detalhada: direcione para a visita.
 
 DOCUMENTAÇÃO (RGI)
@@ -1020,6 +1066,7 @@ def webhook():
 
             manual_text = raw_text.strip()
             print(f"[MANUAL] Você digitou para {pause_phone}: '{manual_text[:40]}'")
+            mark_manual_activity(pause_phone)
 
             if manual_text == RESUME_KEYWORD:
                 clear_pause(pause_phone)
@@ -1099,7 +1146,8 @@ def webhook():
                 notify_ai_failure(phone)
                 return jsonify({'status': 'ai_error'}), 200
 
-            time.sleep(PAUSE_GUARD_SECONDS)
+            if had_recent_manual_activity(phone):
+                time.sleep(PAUSE_GUARD_SECONDS)
             if is_paused(phone):
                 print(f"⏸️ {phone} pausado durante geração da resposta — descartando resposta do bot.")
                 return jsonify({'status': 'discarded_pause_race'}), 200
@@ -1144,8 +1192,10 @@ def webhook():
                 media_flag = True
 
         # Fecha a janela de risco: se a Evelin pausou manualmente enquanto a IA gerava
-        # a resposta, descarta a resposta do bot em silêncio.
-        time.sleep(PAUSE_GUARD_SECONDS)
+        # a resposta, descarta a resposta do bot em silêncio. Só vale a pena esperar
+        # se ela esteve ativa nesse número há pouco — senão só atrasa toda mensagem à toa.
+        if had_recent_manual_activity(phone):
+            time.sleep(PAUSE_GUARD_SECONDS)
         if is_paused(phone):
             print(f"⏸️ {phone} pausado durante geração da resposta — descartando resposta do bot.")
             return jsonify({'status': 'discarded_pause_race'}), 200
