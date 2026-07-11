@@ -13,7 +13,7 @@ import csv
 
 app = Flask(__name__)
 
-# ─── CONFIGURAÇÕES ────────────────────────────────────────────────────────────
+# ─── CONFIGURAÇÕES ──────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY       = os.environ.get('ANTHROPIC_API_KEY')
 OPENAI_API_KEY          = os.environ.get('OPENAI_API_KEY')
 UAZAPI_URL              = os.environ.get('UAZAPI_URL', 'https://evelinabreu.uazapi.com')
@@ -22,7 +22,7 @@ INSTANCE_NAME           = os.environ.get('INSTANCE_NAME', 'evelin')
 RECOVERY_INTERVAL_HOURS = float(os.environ.get('RECOVERY_INTERVAL_HOURS', '2'))
 ALERT_NUMBERS           = ['5522999004419', '5522995511909']
 
-# ─── MODELO ──────────────────────────────────────────────────────────────────
+# ─── MODELO ─────────────────────────────────────────────────────────────────
 # claude-haiku-4-5-20251001 = ~15x mais barato que Opus, suficiente para vendas
 AI_MODEL      = os.environ.get('AI_MODEL', 'claude-haiku-4-5-20251001')
 HISTORY_LIMIT = int(os.environ.get('HISTORY_LIMIT', '8'))
@@ -41,8 +41,6 @@ FOLLOWUP_DAY_END    = int(os.environ.get('FOLLOWUP_DAY_END', '21'))
 FOLLOWUP_CHECK_MIN  = int(os.environ.get('FOLLOWUP_CHECK_MIN', '5'))
 
 # ─── MENSAGEM AUTOMÁTICA DO FACEBOOK ─────────────────────────────────────────
-# Primeira mensagem (fromMe): saudação automática do anúncio → ignorar
-# Segunda mensagem (do cliente): texto do botão → tratar como intenção real
 FB_AUTO_GREETING_KEYWORDS = [
     'mensagem de saudação automática',
     'que bom ter você por aqui',
@@ -211,12 +209,12 @@ def set_followup_state(phone, state):
 
 # ─── MÍDIAS ──────────────────────────────────────────────────────────────────
 PHOTOS = [
-    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.56_itxlrx.jpg",
-    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.57_wmlvhl.jpg",
-    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.35_eioep1.jpg",
-    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.57_1_mszdep.jpg",
-    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.35_1_kidkrk.jpg",
-    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779039971/WhatsApp_Image_2026-05-17_at_13.23.34_cxhs57.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-01-pergola_kcvsxw.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-02-vista-mar-postes_ox8vnn.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-03-terreno-caminhao_a9vwmd.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-04-casa-arvore_otqppf.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-05-terreno-caminhao-2_rti3gm.jpg",
+    "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-06-estrada-postes_qjwp2j.jpg",
     "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1779040450/Editedimage_1776197718307_ms669e.png",
 ]
 VIDEO_URL_1 = "https://res.cloudinary.com/dd6o3z4ma/video/upload/v1779039974/WhatsApp_Video_2026-05-17_at_13.15.06_zrc6fs.mp4"
@@ -227,14 +225,14 @@ GREETING = "Oi! Aqui é a Evelin Abreu, corretora de imóveis. Tô com um lança
 
 SYSTEM_PROMPT = """Você é Evelin Abreu, corretora de imóveis do Praia Rasa de Búzios 2. Atenda como a própria Evelin no WhatsApp — simpática, direta, como um bate-papo profissional. Nunca revele que é IA. Se perguntarem, é a própria Evelin.
 
-═══════════════════════════════════════════
+════════════════════════════════════════════
 REGRA ABSOLUTA: RESPONDA A PERGUNTA PRIMEIRO
 ═══════════════════════════════════════════
 Se o cliente fizer qualquer pergunta direta — localização, preço, documentação, infraestrutura — RESPONDA PRIMEIRO. Só depois avance no fluxo. NUNCA ignore uma pergunta para seguir o script.
 
 ═══════════════════════════════════════════
 DETECTE O PERFIL DO CLIENTE E ADAPTE
-═══════════════════════════════════════════
+══════════════════════════════════════════
 
 PERFIL A — MORADOR LOCAL / CONHECE A REGIÃO
 Sinais: menciona praias, bairros, referências locais (Cruzeiro, pórtico, Rasa, Geribá, INEJ), diz "conheço a região", "passo por lá", "moro em Búzios/Cabo Frio/Arraial"
