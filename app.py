@@ -822,12 +822,29 @@ def is_duplicate_msg(message, phone=''):
         if not msg_id: return False
         key = f"dup:{msg_id}"
         if r.exists(key):
-            print(f"🔁 Duplicata ignorada: {msg_id[:30]}")
+            print(f"🔁 Duplicata ignorada (id): {msg_id[:30]}")
             return True
         r.setex(key, 120, phone or "unknown")
         return False
     except Exception as e:
         print(f"Dedup error: {e}")
+        return False
+
+def is_duplicate_content(phone, text):
+    """Segunda camada de dedup, por conteúdo — cobre o caso em que a UAZAPI manda
+    o mesmo evento duas vezes sem um id/messageId estável (o dedup por id acima
+    não pega esse caso, porque cada entrega chega sem identificador confiável)."""
+    r = get_redis()
+    if not r: return False
+    try:
+        key = f"dupcontent:{phone}:{text[:200]}"
+        if r.exists(key):
+            print(f"🔁 Duplicata ignorada (conteúdo): {phone} '{text[:40]}'")
+            return True
+        r.setex(key, 15, "1")
+        return False
+    except Exception as e:
+        print(f"Dedup content error ({phone}): {e}")
         return False
 
 def get_phone_from_msg_id(message):
@@ -1168,6 +1185,9 @@ def webhook():
 
         if not text:
             return jsonify({'status': 'no_text'}), 200
+
+        if is_duplicate_content(phone, text):
+            return jsonify({'status': 'duplicate_content'}), 200
 
         print(f"phone='{phone}', text='{text[:80]}'")
 
