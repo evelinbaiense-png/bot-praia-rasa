@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import anthropic
 import requests
 import json
+import re
 import os
 import time
 import tempfile
@@ -23,13 +24,16 @@ RECOVERY_INTERVAL_HOURS = float(os.environ.get('RECOVERY_INTERVAL_HOURS', '2'))
 ALERT_NUMBERS           = ['5522999004419', '5522995511909']
 
 # ─── MODELO ─────────────────────────────────────────────────────────────────
-# claude-haiku-4-5-20251001 = ~15x mais barato que Opus, suficiente para vendas
-AI_MODEL      = os.environ.get('AI_MODEL', 'claude-haiku-4-5-20251001')
-HISTORY_LIMIT = int(os.environ.get('HISTORY_LIMIT', '8'))
+AI_MODEL            = os.environ.get('AI_MODEL', 'claude-sonnet-5')
+HISTORY_LIMIT       = int(os.environ.get('HISTORY_LIMIT', '30'))
+MAX_TOKENS_REPLY    = int(os.environ.get('MAX_TOKENS_REPLY', '2000'))
+MAX_TOKENS_FOLLOWUP = int(os.environ.get('MAX_TOKENS_FOLLOWUP', '1000'))
+MAX_TOKENS_EXTRACT  = int(os.environ.get('MAX_TOKENS_EXTRACT', '500'))
 
 # ─── TRAVA DE PAUSA ──────────────────────────────────────────────────────────
-RESUME_KEYWORD = '.'
-PAUSE_TTL      = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
+RESUME_KEYWORD      = '.'
+PAUSE_TTL           = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
+PAUSE_GUARD_SECONDS = float(os.environ.get('PAUSE_GUARD_SECONDS', '5'))
 
 # ─── FOLLOW-UP ───────────────────────────────────────────────────────────────
 FOLLOWUP_ENABLED    = os.environ.get('FOLLOWUP_ENABLED', 'true').lower() == 'true'
@@ -112,10 +116,12 @@ def buscar_distancia_osm(local_nome):
 # ─── REDIS ───────────────────────────────────────────────────────────────────
 import redis as _redis_lib
 
-REDIS_URL      = os.environ.get('REDIS_URL', '')
-CONV_TTL       = 7 * 24 * 3600
-_redis_client  = None
-_redis_warned  = False
+REDIS_URL         = os.environ.get('REDIS_URL', '')
+CONV_TTL          = 7 * 24 * 3600
+MEDIA_SENT_TTL    = 7 * 24 * 3600
+HOT_LEAD_ALERT_TTL = 24 * 3600
+_redis_client     = None
+_redis_warned     = False
 
 def get_redis():
     global _redis_client, _redis_warned
@@ -206,6 +212,37 @@ def set_followup_state(phone, state):
         r.setex(f"fu:{phone}", CONV_TTL, json.dumps(state))
     except Exception as e:
         print(f"Redis fu set error ({phone}): {e}")
+
+def mark_media_sent(phone):
+    r = get_redis()
+    if not r: return
+    try:
+        r.setex(f"media_sent:{phone}", MEDIA_SENT_TTL, "1")
+    except Exception as e:
+        print(f"Redis mark_media_sent error ({phone}): {e}")
+
+def was_media_sent(phone):
+    r = get_redis()
+    if not r: return False
+    try:
+        return r.exists(f"media_sent:{phone}") == 1
+    except Exception as e:
+        print(f"Redis was_media_sent error ({phone}): {e}")
+        return False
+
+def should_send_hot_lead_alert(phone):
+    """Retorna True e marca o cooldown se ainda não houve alerta de lead quente nas últimas 24h."""
+    r = get_redis()
+    if not r: return True
+    try:
+        key = f"hotlead_alert:{phone}"
+        if r.exists(key):
+            return False
+        r.setex(key, HOT_LEAD_ALERT_TTL, "1")
+        return True
+    except Exception as e:
+        print(f"Redis should_send_hot_lead_alert error ({phone}): {e}")
+        return True
 
 # ─── MÍDIAS ──────────────────────────────────────────────────────────────────
 PHOTOS = [
@@ -315,17 +352,57 @@ Para locais NÃO listados: "Fica na Estrada dos Búzios (RJ-106), Bairro da Rasa
 NUNCA invente distância.
 
 ═══════════════════════════════════════════
+REGRA DE PERGUNTAS
+═══════════════════════════════════════════
+- NUNCA envie mais de uma pergunta na mesma mensagem.
+- NUNCA envie uma pergunta de qualificação logo após já ter feito outra sem
+  o cliente ter respondido a primeira.
+- Se você tiver várias perguntas de qualificação pendentes na estratégia
+  (finalidade, tamanho, prazo, etc.), escolha APENAS UMA por vez e espere
+  a resposta do cliente antes de perguntar a próxima.
+
+Exemplo ERRADO: "Você procura para morar ou investir? E qual tamanho de
+lote te interessa mais, 300 ou 600m²?"
+Exemplo CORRETO: "Você procura para morar ou investir?" (aguarda resposta,
+só depois pergunta o próximo item)
+
+═══════════════════════════════════════════
+NÃO REPITA O QUE JÁ FOI DITO
+═══════════════════════════════════════════
+Não repita informação que você já mencionou nesta conversa (valores, condições,
+se já perguntou finalidade morar/investir/veraneio), a menos que o cliente
+pergunte de novo ou peça para relembrar. Antes de responder, olhe o histórico
+da conversa e confirme se aquilo já não foi dito.
+
+═══════════════════════════════════════════
+TAMANHO DE RESPOSTA
+═══════════════════════════════════════════
+- Padrão: curto, direto, tom de WhatsApp profissional (1-3 frases).
+- Pode ser mais longo APENAS quando o assunto exigir detalhe real:
+  valores e condições de pagamento completas, localização/como chegar,
+  documentação (RGI, associação de moradores).
+- Fora desses tópicos, nunca alongar a resposta artificialmente.
+- Nunca envie um resumo de valores se o cliente não pediu e você já
+  mencionou isso antes nesta conversa.
+- Se a resposta tiver mais de uma ideia separada, quebre em parágrafos
+  curtos (linha em branco entre eles) — cada parágrafo vira uma mensagem
+  separada no WhatsApp.
+
+═══════════════════════════════════════════
 COMO CONVERSAR
 ═══════════════════════════════════════════
-- Uma pergunta por vez. Sempre.
 - Termine com pergunta ou próximo passo claro.
-- NUNCA empilhe perguntas.
 - NUNCA repita a mesma frase em mensagens seguidas.
-- NUNCA mande bloco grande de texto — quebre em mensagens curtas e naturais.
 - Clientes mais velhos: "o senhor" / "a senhora".
 - Comentário religioso: "Amém!" / "Dia abençoado".
 - Português sempre, mesmo que o cliente escreva em espanhol.
-- Emojis com moderação (😊 🏡 👍 📍).
+- Emojis neutros e com moderação (😊 🏡 👍 📍). NUNCA use corações ou beijos.
+- Aviso de plantão por escala: mencione apenas UMA vez por conversa, quando
+  houver interesse real de visita — não repita em mensagens seguintes.
+- NUNCA se despeça ou encerre a conversa por conta própria. "Ok, obrigada",
+  "valeu" ou similar NÃO significa fim de atendimento — continue disponível
+  e não trate como despedida a menos que o cliente diga explicitamente que
+  não quer mais conversar.
 
 ═══════════════════════════════════════════
 QUANDO NÃO SOUBER RESPONDER
@@ -442,6 +519,8 @@ def _send_raw(phone, text):
     try:
         response = requests.post(url, headers=headers, json=data, timeout=10)
         print(f"Alert sent to {phone}: {response.status_code}")
+        if response.status_code != 200:
+            print(f"Alert failure body ({phone}): {response.text[:300]}")
         return response
     except Exception as e:
         print(f"Error sending alert to {phone}: {e}")
@@ -454,6 +533,8 @@ def send_message(phone, text):
     try:
         response = requests.post(url, headers=headers, json=data, timeout=10)
         print(f"Text sent to {phone}: {response.status_code}")
+        if response.status_code != 200:
+            print(f"Send failure body ({phone}): {response.text[:300]}")
         return response
     except Exception as e:
         print(f"Error sending text: {e}")
@@ -494,19 +575,30 @@ def send_media_package(phone):
             time.sleep(1)
         time.sleep(2)
         send_message(phone, "O que achou? 😊")
+        mark_media_sent(phone)
         print(f"Media package complete for {phone}")
     except Exception as e:
         print(f"Error in send_media_package for {phone}: {e}")
 
+def _split_into_chunks(text):
+    """Quebra a resposta em partes por parágrafo (linha em branco), para simular
+    mensagens curtas e sequenciais de WhatsApp em vez de um bloco único."""
+    parts = [p.strip() for p in text.split('\n\n') if p.strip()]
+    return parts if parts else [text]
+
 def send_and_check(phone, text):
-    resp   = send_message(phone, text)
-    status = getattr(resp, 'status_code', None) if resp is not None else None
-    if status != 200:
-        print(f"❌ FALHA DE ENVIO para {phone} (status {status}).")
-        for number in ALERT_NUMBERS:
-            if number != phone:
-                _send_raw(number, f"⚠️ Falha ao enviar para {phone} (status {status}). Verifique o WhatsApp.")
-        return False
+    chunks = _split_into_chunks(text)
+    for i, chunk in enumerate(chunks):
+        resp   = send_message(phone, chunk)
+        status = getattr(resp, 'status_code', None) if resp is not None else None
+        if status != 200:
+            print(f"❌ FALHA DE ENVIO para {phone} (status {status}).")
+            for number in ALERT_NUMBERS:
+                if number != phone:
+                    _send_raw(number, f"⚠️ Falha ao enviar para {phone} (status {status}). Verifique o WhatsApp.")
+            return False
+        if i < len(chunks) - 1:
+            time.sleep(1.2)
     return True
 
 def notify_ai_failure(phone):
@@ -549,6 +641,17 @@ def extract_text(message):
     return str(val) if val else ''
 
 # ─── IA ───────────────────────────────────────────────────────────────────────
+def _extract_text(response):
+    """Extrai o primeiro bloco de texto da resposta — com thinking adaptativo
+    ligado (padrão do Sonnet 5), a resposta pode conter blocos que não são texto."""
+    for block in response.content:
+        if getattr(block, 'type', None) == 'text':
+            return block.text
+    return ""
+
+def _count_questions(text):
+    return text.count('?')
+
 def get_ai_response(phone, user_message):
     client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     history = append_message(phone, "user", user_message)
@@ -591,16 +694,35 @@ def get_ai_response(phone, user_message):
 
     try:
         response = client.messages.create(
-            model=AI_MODEL, max_tokens=600, system=system, messages=api_messages
+            model=AI_MODEL, max_tokens=MAX_TOKENS_REPLY, system=system, messages=api_messages
         )
     except Exception as e:
         print(f"❌ ERRO NA IA para {phone}: {e}")
         return None, False, False
 
-    reply_raw   = response.content[0].text
+    reply_raw   = _extract_text(response)
     alert_flag  = '[ALERTA]' in reply_raw
     media_flag  = '[ENVIAR_MIDIA]' in reply_raw
     reply_clean = reply_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
+
+    # Auditoria/correção de empilhamento de perguntas (uma pergunta por vez)
+    if _count_questions(reply_clean) > 1:
+        print(f"[EMPILHAMENTO] {phone}: resposta com múltiplas perguntas — tentando regenerar. Original: {reply_clean[:200]}")
+        try:
+            retry_system = system + "\n\n[CORREÇÃO: sua última resposta continha mais de uma pergunta. Regenere respondendo com NO MÁXIMO uma pergunta, seguindo a REGRA DE PERGUNTAS.]"
+            retry_response = client.messages.create(
+                model=AI_MODEL, max_tokens=MAX_TOKENS_REPLY, system=retry_system, messages=api_messages
+            )
+            retry_raw = _extract_text(retry_response)
+            if retry_raw and _count_questions(retry_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '')) <= 1:
+                reply_raw   = retry_raw
+                alert_flag  = '[ALERTA]' in reply_raw
+                media_flag  = '[ENVIAR_MIDIA]' in reply_raw
+                reply_clean = reply_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
+            else:
+                print(f"[EMPILHAMENTO] {phone}: regeneração não resolveu — mantendo original.")
+        except Exception as e:
+            print(f"[EMPILHAMENTO] {phone}: erro ao regenerar: {e}")
 
     hist_text = reply_clean + ("\n[Enviei fotos e vídeos e perguntei: O que achou?]" if media_flag else "")
     append_message(phone, "assistant", hist_text)
@@ -625,8 +747,8 @@ def generate_followup(phone, stage):
         ] + last_msgs + [
             {"role": "user", "content": "[Cliente ficou em silêncio. Escreva a mensagem de retomada.]"}
         ]
-        response = client.messages.create(model=AI_MODEL, max_tokens=300, system=system, messages=api_messages)
-        msg      = response.content[0].text
+        response = client.messages.create(model=AI_MODEL, max_tokens=MAX_TOKENS_FOLLOWUP, system=system, messages=api_messages)
+        msg      = _extract_text(response)
         return msg.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
     except Exception as e:
         print(f"generate_followup error ({phone}): {e}")
@@ -729,7 +851,8 @@ def extract_and_save_visit(phone, history):
         client      = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         recent_text = json.dumps(history[-12:], ensure_ascii=False)
         response    = client.messages.create(
-            model=AI_MODEL, max_tokens=150,
+            model=AI_MODEL, max_tokens=MAX_TOKENS_EXTRACT,
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": (
                 "Analise esta conversa e extraia os dados da visita agendada. "
                 "Responda APENAS em JSON válido:\n"
@@ -737,7 +860,12 @@ def extract_and_save_visit(phone, history):
                 f"Conversa:\n{recent_text}"
             )}]
         )
-        data       = json.loads(response.content[0].text.strip())
+        raw_text = _extract_text(response).strip()
+        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if not json_match:
+            print(f"extract_and_save_visit: nenhum JSON encontrado na resposta ({phone}): {raw_text[:200]}")
+            return
+        data       = json.loads(json_match.group(0))
         name       = data.get('name', 'Cliente')
         day        = data.get('day', '')
         period     = data.get('period', 'desconhecido')
@@ -827,6 +955,9 @@ def followup_sweep():
             if not next_stage: continue
             msg = generate_followup(phone, next_stage)
             if msg:
+                if is_paused(phone):
+                    print(f"⏸️ {phone} pausado antes do envio do follow-up — descartando.")
+                    continue
                 if send_and_check(phone, msg):
                     append_message(phone, "assistant", msg)
                 state["stage"] = next_stage
@@ -856,7 +987,7 @@ def webhook():
         msg_type = message.get('type', '') or message.get('messageType', '')
         if (message.get('isEdit') or message.get('updateType') or
                 msg_type in ('messageUpdate', 'editedMessage', 'protocolMessage',
-                             'reactionMessage', 'senderKeyDistributionMessage',
+                             'reactionMessage', 'reaction', 'senderKeyDistributionMessage',
                              'messageContextInfo', 'statusUpdate')):
             return jsonify({'status': 'ignored'}), 200
 
@@ -909,9 +1040,8 @@ def webhook():
             set_pause(phone)
             return jsonify({'status': 'paused_by_command'}), 200
 
-        if text_cmd == RESUME_KEYWORD:
-            clear_pause(phone)
-            return jsonify({'status': 'resumed'}), 200
+        # A reativação por "." é reservada a mensagens fromMe (ver seção 1 acima) —
+        # um cliente digitando "." não deve conseguir despausar o próprio atendimento.
 
         # ── 2) BOT PAUSADO ───────────────────────────────────────────────────
         if is_paused(phone):
@@ -926,7 +1056,7 @@ def webhook():
         text = ""
 
         is_audio       = msg_type in ('audio', 'ptt', 'audioMessage', 'PTT')
-        is_media_audio = msg_type == 'media' and media_type not in ('image', 'video', 'document', 'sticker')
+        is_media_audio = msg_type == 'media' and media_type in ('audio', 'ptt', 'ogg', 'opus', '')
 
         if is_audio or is_media_audio:
             raw = (
@@ -968,11 +1098,21 @@ def webhook():
             if reply is None:
                 notify_ai_failure(phone)
                 return jsonify({'status': 'ai_error'}), 200
+
+            time.sleep(PAUSE_GUARD_SECONDS)
+            if is_paused(phone):
+                print(f"⏸️ {phone} pausado durante geração da resposta — descartando resposta do bot.")
+                return jsonify({'status': 'discarded_pause_race'}), 200
+
             send_and_check(phone, reply)
             if alert_flag:
                 threading.Thread(target=send_alert, args=(phone, "pergunta sem resposta", "[imagem]"), daemon=True).start()
             if media_flag:
                 threading.Thread(target=send_media_package, args=(phone,)).start()
+            return jsonify({'status': 'ok'}), 200
+        elif msg_type == 'media':
+            # Tipo de mídia não suportado (localização, contato, enquete, etc.) — não trata como áudio.
+            send_message(phone, "Oi! 😊 Recebi seu arquivo, mas não consigo processar esse tipo por aqui. Pode me contar em texto?")
             return jsonify({'status': 'ok'}), 200
         else:
             print(f"Skipping type: {msg_type}")
@@ -992,8 +1132,8 @@ def webhook():
             notify_ai_failure(phone)
             return jsonify({'status': 'ai_error'}), 200
 
-        # Rede de segurança para mídia
-        if not media_flag:
+        # Rede de segurança para mídia — não reaciona se o pacote já foi enviado nesta conversa
+        if not media_flag and not was_media_sent(phone):
             media_keywords = ['quero ver', 'queria ver', 'pode mandar', 'manda sim',
                               'com certeza', 'claro que sim', 'quero as fotos',
                               'foto', 'fotos', 'video', 'vídeo', 'videos', 'vídeos']
@@ -1003,12 +1143,19 @@ def webhook():
                     any(kw in last_bot.lower() for kw in ['foto', 'vídeo', 'video', 'imagens', 'mandar'])):
                 media_flag = True
 
+        # Fecha a janela de risco: se a Evelin pausou manualmente enquanto a IA gerava
+        # a resposta, descarta a resposta do bot em silêncio.
+        time.sleep(PAUSE_GUARD_SECONDS)
+        if is_paused(phone):
+            print(f"⏸️ {phone} pausado durante geração da resposta — descartando resposta do bot.")
+            return jsonify({'status': 'discarded_pause_race'}), 200
+
         send_and_check(phone, reply)
 
         # Alertas em thread — não atrasa a resposta ao cliente
         if alert_flag:
             threading.Thread(target=send_alert, args=(phone, "pergunta sem resposta", text), daemon=True).start()
-        elif hot:
+        elif hot and should_send_hot_lead_alert(phone):
             threading.Thread(target=send_hot_lead_alert, args=(phone, hot_motivo, text), daemon=True).start()
 
         if media_flag:
@@ -1108,4 +1255,7 @@ if __name__ == '__main__':
     scheduler.add_job(visit_reminder_sweep,  'interval', minutes=30)
     scheduler.start()
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # threaded=True é obrigatório: sem isso, o servidor processa um webhook por vez e o
+    # guard de pausa (sleep + re-checagem) nunca vê a mensagem manual da Evelin chegar
+    # enquanto o webhook do cliente está bloqueado esperando a IA.
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
