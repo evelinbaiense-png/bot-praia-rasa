@@ -299,6 +299,10 @@ GUIE A CONVERSA COMO UMA VENDEDORA EXPERIENTE
 - Isso NÃO significa perguntar sobre visita a cada mensagem (ver PASSO 5) —
   significa que cada resposta sua tem direção clara, incentivando o cliente
   a continuar engajado, nunca uma resposta que só informa e encerra o assunto.
+- Você é uma vendedora profissional falando com um cliente, NÃO uma amiga
+  batendo papo. Seja simpática, mas direta e objetiva — sem enrolar, sem
+  ficar reafirmando a mesma coisa de formas diferentes para "parecer" mais
+  completa. Firmeza e clareza vendem mais do que simpatia excessiva.
 
 ═══════════════════════════════════════════
 DETECTE O PERFIL DO CLIENTE E ADAPTE
@@ -424,6 +428,20 @@ TAMANHO DE RESPOSTA
 - Se a resposta tiver mais de uma ideia separada, quebre em parágrafos
   curtos (linha em branco entre eles) — cada parágrafo vira uma mensagem
   separada no WhatsApp.
+
+⚠️ "Mais longo" NUNCA significa repetir. Cada parágrafo tem que trazer
+informação NOVA — nunca reafirme o mesmo preço, a mesma pergunta ou a
+mesma frase (mesmo reformulada) em outro parágrafo da MESMA resposta.
+Antes de enviar, releia sua própria resposta e corte qualquer parágrafo
+que só repita algo que outro parágrafo dela já disse.
+
+Exemplo ERRADO (repete dentro da mesma resposta):
+"Lotes de 600m²: entrada R$14.000, parcelas a partir de R$1.599/mês. [...]
+Qual tamanho te interessou mais, 300 ou 600m²? [...] Lotes de 600m²: entrada
+R$14.000, parcelas a partir de R$1.599/mês. [...] Algum tamanho te chamou
+mais atenção, o de 300 ou o 600?"
+Exemplo CORRETO: cada dado aparece UMA vez, e a pergunta de qualificação
+também aparece UMA vez só, no final.
 
 ═══════════════════════════════════════════
 COMO CONVERSAR
@@ -709,6 +727,12 @@ def _extract_text(response):
 def _count_questions(text):
     return text.count('?')
 
+def _has_duplicate_paragraphs(text):
+    """Detecta parágrafo repetido verbatim dentro da mesma resposta — pega o caso
+    de o modelo reafirmar o mesmo preço/pergunta em partes diferentes do texto."""
+    parts = [p.strip().lower() for p in text.split('\n\n') if p.strip()]
+    return len(parts) != len(set(parts))
+
 def get_ai_response(phone, user_message):
     client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     history = append_message(phone, "user", user_message)
@@ -762,20 +786,31 @@ def get_ai_response(phone, user_message):
     media_flag  = '[ENVIAR_MIDIA]' in reply_raw
     reply_clean = reply_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
 
-    # Auditoria/correção de empilhamento de perguntas (uma pergunta por vez)
-    if _count_questions(reply_clean) > 1:
-        print(f"[EMPILHAMENTO] {phone}: resposta com múltiplas perguntas — tentando regenerar. Original: {reply_clean[:200]}")
+    # Auditoria/correção de empilhamento de perguntas e repetição interna
+    stacked_questions  = _count_questions(reply_clean) > 1
+    duplicated_content = _has_duplicate_paragraphs(reply_clean)
+    if stacked_questions or duplicated_content:
+        motivo = "múltiplas perguntas" if stacked_questions else "parágrafo repetido"
+        if stacked_questions and duplicated_content:
+            motivo = "múltiplas perguntas e parágrafo repetido"
+        print(f"[EMPILHAMENTO] {phone}: resposta com {motivo} — tentando regenerar. Original: {reply_clean[:200]}")
         try:
-            retry_system = system + "\n\n[CORREÇÃO: sua última resposta continha mais de uma pergunta. Regenere respondendo com NO MÁXIMO uma pergunta, seguindo a REGRA DE PERGUNTAS.]"
+            retry_system = system + (
+                "\n\n[CORREÇÃO: sua última resposta tinha problema de qualidade "
+                f"({motivo}). Regenere a resposta: NO MÁXIMO uma pergunta "
+                "(REGRA DE PERGUNTAS) e NUNCA repita o mesmo preço, pergunta ou "
+                "frase em mais de um parágrafo (TAMANHO DE RESPOSTA).]"
+            )
             retry_response = client.messages.create(
                 model=AI_MODEL, max_tokens=MAX_TOKENS_REPLY, system=retry_system, messages=api_messages
             )
-            retry_raw = _extract_text(retry_response)
-            if retry_raw and _count_questions(retry_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '')) <= 1:
+            retry_raw   = _extract_text(retry_response)
+            retry_clean = retry_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip() if retry_raw else ""
+            if retry_raw and _count_questions(retry_clean) <= 1 and not _has_duplicate_paragraphs(retry_clean):
                 reply_raw   = retry_raw
                 alert_flag  = '[ALERTA]' in reply_raw
                 media_flag  = '[ENVIAR_MIDIA]' in reply_raw
-                reply_clean = reply_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
+                reply_clean = retry_clean
             else:
                 print(f"[EMPILHAMENTO] {phone}: regeneração não resolveu — mantendo original.")
         except Exception as e:
