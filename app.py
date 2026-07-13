@@ -264,6 +264,54 @@ def had_recent_manual_activity(phone):
         print(f"Redis had_recent_manual_activity error ({phone}): {e}")
         return False
 
+# ─── ENCERRAMENTO DE CONVERSA (evita loop de despedida) ──────────────────────
+CLOSING_KEYWORDS = [
+    'obrigad', 'valeu', 'vlw', 'agradeç', 'agradec', 'boas vendas', 'boa venda',
+    'ótimos negócios', 'otimos negocios', 'sucesso', 'fico à dispos',
+    'fico a dispos', 'à disposição', 'a disposicao', 'combinado', 'abraço', 'abraco',
+    'até mais', 'ate mais', 'até logo', 'ate logo', 'nos falamos',
+    'grato', 'grata', 'de nada', 'deus abençoe', 'ótimo dia e', 'otimo dia e',
+    'imagina', 'qualquer coisa', 'só chamar', 'so chamar', 'amém', 'amem',
+    'ótimas vendas', 'otimas vendas', 'boas negociações',
+]
+
+def is_closing_message(text):
+    """Mensagem de pura cortesia/despedida: curta, sem pergunta, sem sinal de compra.
+    Palavras ambíguas que também servem de saudação de abertura (bom dia, boa tarde)
+    ficam de fora de propósito, para não confundir início de conversa com despedida."""
+    t = (text or '').lower().strip()
+    if not t or '?' in t:
+        return False
+    if len(t.split()) > 8:
+        return False
+    if any(s in t for s in HOT_LEAD_SIGNALS):
+        return False
+    return any(k in t for k in CLOSING_KEYWORDS)
+
+def in_closing_state(phone):
+    r = get_redis()
+    if not r: return False
+    try:
+        return r.exists(f"closing:{phone}") == 1
+    except Exception:
+        return False
+
+def set_closing_state(phone):
+    r = get_redis()
+    if not r: return
+    try:
+        r.setex(f"closing:{phone}", 1800, "1")  # 30 min
+    except Exception as e:
+        print(f"Redis set_closing_state error ({phone}): {e}")
+
+def clear_closing_state(phone):
+    r = get_redis()
+    if not r: return
+    try:
+        r.delete(f"closing:{phone}")
+    except Exception:
+        pass
+
 # ─── MÍDIAS ──────────────────────────────────────────────────────────────────
 PHOTOS = [
     "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-01-pergola_kcvsxw.jpg",
@@ -454,10 +502,15 @@ COMO CONVERSAR
 - Emojis neutros e com moderação (😊 🏡 👍 📍). NUNCA use corações ou beijos.
 - Aviso de plantão por escala: mencione apenas UMA vez por conversa, quando
   houver interesse real de visita — não repita em mensagens seguintes.
-- NUNCA se despeça ou encerre a conversa por conta própria. "Ok, obrigada",
-  "valeu" ou similar NÃO significa fim de atendimento — continue disponível
-  e não trate como despedida a menos que o cliente diga explicitamente que
-  não quer mais conversar.
+- No MEIO da qualificação, não abandone: "ok", "obrigada", "valeu" ditos
+  enquanto vocês ainda falam do produto NÃO são fim de atendimento — continue.
+- MAS quando o cliente estiver claramente só se despedindo ou trocando
+  cortesias (agradecer, "boas vendas", "ótimo dia", "fico à disposição",
+  "combinado", "abraço"), responda de forma breve e calorosa UMA vez e
+  ENCERRE — sem nova pergunta, sem oferecer mais nada, sem gancho que force
+  o cliente a responder. Ex.: "Obrigada, [nome]! Qualquer coisa estou por
+  aqui 😊" e pare. NUNCA fique devolvendo cortesia infinitamente — se o
+  cliente responder outra cortesia, não precisa responder de novo.
 
 ═══════════════════════════════════════════
 QUANDO NÃO SOUBER RESPONDER
@@ -521,7 +574,14 @@ FINANCIAMENTO
 - Primeira parcela em 45 dias. Pode construir com 3 parcelas pagas.
 - Prazo: de 12 até 156 parcelas (até 13 anos). O prazo MÁXIMO é 156 parcelas —
   nunca informe outro número no lugar desse. IGPM: correção anual.
-- Simulação detalhada: direcione para a visita.
+- ⚠️ Se o cliente perguntar "quantas parcelas", "em quantos meses", "quantas
+  vezes" ou "quantas parcelas de R$899/R$1.599": RESPONDA COM O NÚMERO, não
+  desvie para a visita. A parcela mais baixa (R$899 no 300m², R$1.599 no 600m²)
+  é calculada no prazo MAIS LONGO, 156x. Prazos menores deixam a parcela maior.
+  Ex.: "A de R$899 é no prazo mais longo, 156x (13 anos). Se quiser quitar mais
+  rápido, dá pra fazer em menos parcelas, aí a mensal sobe um pouco."
+- Só a simulação PERSONALIZADA (com entrada específica, prazo exato, datas) é
+  que fica pra visita — a estrutura geral acima você SEMPRE informa na hora.
 
 DOCUMENTAÇÃO (RGI)
 Tem RGI. A incorporadora está finalizando na prefeitura. Transferência para o nome do comprador é opcional e por conta do cliente após quitar.
@@ -587,30 +647,48 @@ def send_hot_lead_alert(phone_client, motivo, ultima_msg=""):
 def get_instance_token():
     return os.environ.get('INSTANCE_TOKEN', UAZAPI_TOKEN)
 
-def _send_raw(phone, text):
+def _toggle_ninth_digit(phone):
+    """Alterna o 9º dígito de um celular brasileiro (55 + DDD + número).
+    Muitos números de WhatsApp — sobretudo em DDDs do interior — estão
+    registrados sem o nono dígito. Quando a UAZAPI recusa com 'not on
+    WhatsApp', tentamos a forma alternativa. Retorna None se não se aplica."""
+    if not phone.startswith('55') or len(phone) not in (12, 13):
+        return None
+    country, ddd, rest = phone[:2], phone[2:4], phone[4:]
+    if len(rest) == 9 and rest[0] == '9':
+        return country + ddd + rest[1:]   # remove o 9º dígito
+    if len(rest) == 8:
+        return country + ddd + '9' + rest  # adiciona o 9º dígito
+    return None
+
+def _post_text_with_retry(phone, text, label):
+    """Envia texto pela UAZAPI. Se vier 'not on WhatsApp', tenta uma vez com o
+    9º dígito alternado (usado tanto para alertas quanto para clientes)."""
     url     = f"{UAZAPI_URL}/send/text"
     headers = {"token": get_instance_token(), "Content-Type": "application/json"}
-    data    = {"number": phone, "text": text}
+    response = requests.post(url, headers=headers, json={"number": phone, "text": text}, timeout=10)
+    print(f"{label} sent to {phone}: {response.status_code}")
+    if response.status_code != 200:
+        body = response.text[:300]
+        print(f"{label} failure body ({phone}): {body}")
+        alt = _toggle_ninth_digit(phone)
+        if alt and ('not on whatsapp' in body.lower() or 'not exists' in body.lower() or 'invalid' in body.lower()):
+            response = requests.post(url, headers=headers, json={"number": alt, "text": text}, timeout=10)
+            print(f"{label} retry to {alt}: {response.status_code}")
+            if response.status_code != 200:
+                print(f"{label} retry failure body ({alt}): {response.text[:300]}")
+    return response
+
+def _send_raw(phone, text):
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=10)
-        print(f"Alert sent to {phone}: {response.status_code}")
-        if response.status_code != 200:
-            print(f"Alert failure body ({phone}): {response.text[:300]}")
-        return response
+        return _post_text_with_retry(phone, text, "Alert")
     except Exception as e:
         print(f"Error sending alert to {phone}: {e}")
         return None
 
 def send_message(phone, text):
-    url     = f"{UAZAPI_URL}/send/text"
-    headers = {"token": get_instance_token(), "Content-Type": "application/json"}
-    data    = {"number": phone, "text": text}
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=10)
-        print(f"Text sent to {phone}: {response.status_code}")
-        if response.status_code != 200:
-            print(f"Send failure body ({phone}): {response.text[:300]}")
-        return response
+        return _post_text_with_retry(phone, text, "Text")
     except Exception as e:
         print(f"Error sending text: {e}")
         return None
@@ -1045,6 +1123,7 @@ def followup_sweep():
         for key in r.scan_iter("fu:*"):
             phone = key.split("fu:", 1)[1]
             if is_paused(phone): continue
+            if in_closing_state(phone): continue  # cliente já se despediu — não perturbar
             state = get_followup_state(phone)
             if not state: continue
             stage = state.get("stage", 0)
@@ -1129,6 +1208,13 @@ def webhook():
 
             manual_text = raw_text.strip()
             print(f"[MANUAL] Você digitou para {pause_phone}: '{manual_text[:40]}'")
+
+            # Evento fromMe vazio e sem mídia = webhook espúrio (recibo de entrega,
+            # etc.), NÃO um atendimento manual — não pausa por 12h à toa.
+            if not manual_text and not media_type:
+                print(f"[MANUAL] Evento vazio sem mídia ignorado ({pause_phone}).")
+                return jsonify({'status': 'empty_frommme_ignored'}), 200
+
             mark_manual_activity(pause_phone)
 
             if manual_text == RESUME_KEYWORD:
@@ -1234,6 +1320,17 @@ def webhook():
 
         if is_duplicate_content(phone, text):
             return jsonify({'status': 'duplicate_content'}), 200
+
+        # Anti-loop de despedida: se o cliente está só trocando cortesias e o bot
+        # já respondeu uma despedida, não responde de novo (evita loop infinito).
+        if is_closing_message(text):
+            if in_closing_state(phone):
+                append_message(phone, "user", text)
+                print(f"🤝 {phone}: cortesia repetida — encerrando sem responder.")
+                return jsonify({'status': 'closing_silent'}), 200
+            set_closing_state(phone)
+        else:
+            clear_closing_state(phone)
 
         print(f"phone='{phone}', text='{text[:80]}'")
 
