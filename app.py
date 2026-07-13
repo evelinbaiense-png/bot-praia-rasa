@@ -30,6 +30,11 @@ MAX_TOKENS_REPLY    = int(os.environ.get('MAX_TOKENS_REPLY', '2000'))
 MAX_TOKENS_FOLLOWUP = int(os.environ.get('MAX_TOKENS_FOLLOWUP', '1000'))
 MAX_TOKENS_EXTRACT  = int(os.environ.get('MAX_TOKENS_EXTRACT', '500'))
 
+# ─── AGRUPAMENTO DE MENSAGENS ────────────────────────────────────────────────
+# Janela de espera antes de responder: mensagens que o cliente manda em sequência
+# são juntadas numa única chamada de IA (evita uma resposta completa por linha).
+DEBOUNCE_SECONDS = float(os.environ.get('DEBOUNCE_SECONDS', '8'))
+
 # ─── TRAVA DE PAUSA ──────────────────────────────────────────────────────────
 RESUME_KEYWORD         = '.'
 PAUSE_TTL              = int(os.environ.get('PAUSE_TTL_HOURS', '12')) * 3600
@@ -953,7 +958,7 @@ def is_duplicate_msg(message, phone=''):
         if r.exists(key):
             print(f"🔁 Duplicata ignorada (id): {msg_id[:30]}")
             return True
-        r.setex(key, 120, phone or "unknown")
+        r.setex(key, 600, phone or "unknown")
         return False
     except Exception as e:
         print(f"Dedup error: {e}")
@@ -970,7 +975,9 @@ def is_duplicate_content(phone, text):
         if r.exists(key):
             print(f"🔁 Duplicata ignorada (conteúdo): {phone} '{text[:40]}'")
             return True
-        r.setex(key, 15, "1")
+        # 3 min: reentregas da UAZAPI podem chegar bem depois dos 15s originais —
+        # foi uma das fontes das respostas em dobro vistas em produção.
+        r.setex(key, 180, "1")
         return False
     except Exception as e:
         print(f"Dedup content error ({phone}): {e}")
@@ -1159,6 +1166,190 @@ def followup_sweep():
     except Exception as e:
         print(f"followup_sweep error: {e}")
 
+# ─── FILA POR TELEFONE (anti-resposta-dupla / anti-rajada) ───────────────────
+# Agrupa mensagens que o cliente manda em sequência numa única chamada de IA e
+# garante que nunca rodem duas gerações simultâneas para o mesmo telefone — era
+# isso que produzia as respostas "em dobro" com palavras diferentes em produção.
+# Obs.: estruturas em memória do processo — funciona porque o app roda num único
+# processo Flask (ver Procfile). Se um dia migrar para gunicorn com vários
+# workers, isso precisa virar lock/fila no Redis.
+_phone_locks   = {}
+_phone_buffers = {}
+_phone_seq     = {}
+_registry_lock = threading.Lock()
+
+def _enqueue_text(phone, text):
+    with _registry_lock:
+        _phone_buffers.setdefault(phone, []).append(text)
+        _phone_seq[phone] = _phone_seq.get(phone, 0) + 1
+        return _phone_seq[phone], _phone_locks.setdefault(phone, threading.Lock())
+
+def _drain_buffer(phone):
+    with _registry_lock:
+        msgs = _phone_buffers.get(phone) or []
+        _phone_buffers[phone] = []
+        return msgs
+
+def process_client_text(phone, text):
+    """Debounce + trava por telefone: espera DEBOUNCE_SECONDS por mensagens
+    seguintes do mesmo cliente, junta tudo e roda UMA geração por vez."""
+    seq, lock = _enqueue_text(phone, text)
+    time.sleep(DEBOUNCE_SECONDS)
+    with _registry_lock:
+        if _phone_seq.get(phone, 0) != seq:
+            # Chegou mensagem mais nova durante a espera — a thread dela assume
+            # o turno inteiro (com o buffer acumulado).
+            return
+    with lock:
+        while True:
+            msgs = _drain_buffer(phone)
+            if not msgs:
+                break
+            handle_turn(phone, "\n".join(msgs))
+
+def handle_turn(phone, text):
+    """Um turno completo de conversa: decide se responde, chama a IA e envia."""
+    # Anti-loop de despedida: se o cliente está só trocando cortesias e o bot
+    # já respondeu uma despedida, não responde de novo (evita loop infinito).
+    if is_closing_message(text):
+        if in_closing_state(phone):
+            append_message(phone, "user", text)
+            print(f"🤝 {phone}: cortesia repetida — encerrando sem responder.")
+            return
+        set_closing_state(phone)
+    else:
+        clear_closing_state(phone)
+
+    print(f"phone='{phone}', text='{text[:80]}'")
+
+    # Detecta lead quente ANTES de chamar a IA
+    history_atual   = get_conversation(phone)
+    hot, hot_motivo = is_hot_lead(text, history_atual)
+
+    reply, alert_flag, media_flag = get_ai_response(phone, text)
+    if reply is None:
+        notify_ai_failure(phone)
+        return
+
+    # Rede de segurança para mídia — não reaciona se o pacote já foi enviado nesta conversa
+    if not media_flag and not was_media_sent(phone):
+        media_keywords = ['quero ver', 'queria ver', 'pode mandar', 'manda sim',
+                          'com certeza', 'claro que sim', 'quero as fotos',
+                          'foto', 'fotos', 'video', 'vídeo', 'videos', 'vídeos']
+        history_now = get_conversation(phone)
+        last_bot    = next((m['content'] for m in reversed(history_now[:-1]) if m['role'] == 'assistant'), '')
+        if (any(kw in text.lower() for kw in media_keywords) and
+                any(kw in last_bot.lower() for kw in ['foto', 'vídeo', 'video', 'imagens', 'mandar'])):
+            media_flag = True
+
+    # Fecha a janela de risco: se a Evelin pausou manualmente enquanto a IA gerava
+    # a resposta, descarta a resposta do bot em silêncio. Só vale a pena esperar
+    # se ela esteve ativa nesse número há pouco — senão só atrasa toda mensagem à toa.
+    if had_recent_manual_activity(phone):
+        time.sleep(PAUSE_GUARD_SECONDS)
+    if is_paused(phone):
+        print(f"⏸️ {phone} pausado durante geração da resposta — descartando resposta do bot.")
+        return
+
+    send_and_check(phone, reply)
+
+    # Alertas em thread — não atrasa a resposta ao cliente
+    if alert_flag:
+        threading.Thread(target=send_alert, args=(phone, "pergunta sem resposta", text), daemon=True).start()
+    elif hot and should_send_hot_lead_alert(phone):
+        threading.Thread(target=send_hot_lead_alert, args=(phone, hot_motivo, text), daemon=True).start()
+
+    if media_flag:
+        threading.Thread(target=send_media_package, args=(phone,)).start()
+
+    # Detecta visita confirmada
+    updated_history = get_conversation(phone)
+    if is_visit_confirmed(updated_history):
+        threading.Thread(target=extract_and_save_visit, args=(phone, updated_history), daemon=True).start()
+
+def _process_incoming_safe(data, message, phone, text_cmd):
+    try:
+        process_incoming(data, message, phone, text_cmd)
+    except Exception as e:
+        print(f"process_incoming error ({phone}): {e}")
+        import traceback
+        traceback.print_exc()
+
+def process_incoming(data, message, phone, text_cmd):
+    """Parte lenta do webhook (transcrição, IA, envio) — roda em background para
+    o HTTP responder na hora. Se a UAZAPI ficar esperando a IA (20-60s), ela
+    estoura o timeout e REENTREGA o webhook, gerando resposta duplicada."""
+    msg_type   = message.get('type', '') or message.get('messageType', '')
+    media_type = message.get('mediaType', '')
+
+    # ── BOT PAUSADO ──────────────────────────────────────────────────────────
+    if is_paused(phone):
+        if text_cmd:
+            append_message(phone, "user", text_cmd)
+        print(f"⏸️  {phone} em atendimento humano.")
+        return
+
+    set_followup_state(phone, {"last_client_ts": time.time(), "stage": 0})
+
+    text = ""
+
+    is_audio       = msg_type in ('audio', 'ptt', 'audioMessage', 'PTT')
+    is_media_audio = msg_type == 'media' and media_type in ('audio', 'ptt', 'ogg', 'opus', '')
+
+    if is_audio or is_media_audio:
+        raw = (
+            message.get('url') or message.get('mediaUrl') or
+            message.get('audioUrl') or message.get('content') or message.get('body')
+        )
+        if isinstance(raw, dict):
+            audio_url = raw.get('URL') or raw.get('url') or raw.get('directPath')
+            media_key = raw.get('mediaKey', '')
+            if audio_url and media_key:
+                try:
+                    decrypt_resp = requests.post(
+                        f"{UAZAPI_URL}/media/decrypt",
+                        headers={"token": get_instance_token(), "Content-Type": "application/json"},
+                        json={"url": audio_url, "mediaKey": media_key, "type": "audio"},
+                        timeout=30
+                    )
+                    if decrypt_resp.status_code == 200:
+                        audio_url = decrypt_resp.json().get('url', audio_url)
+                except Exception as e:
+                    print(f"Decrypt error: {e}")
+        else:
+            audio_url = raw
+
+        if audio_url:
+            text = transcribe_audio(audio_url)
+            if not text:
+                send_message(phone, "Oi! 😊 Não consegui ouvir o áudio. Pode me mandar por texto?")
+                return
+        else:
+            send_message(phone, "Oi! 😊 Não consegui ouvir o áudio. Pode me mandar por texto?")
+            return
+
+    elif msg_type in ('text', 'Conversation', 'extendedTextMessage'):
+        text = text_cmd
+
+    elif msg_type == 'media' and media_type in ('image', 'video', 'sticker', 'document'):
+        text = "[cliente enviou uma imagem]"
+
+    elif msg_type == 'media':
+        # Tipo de mídia não suportado (localização, contato, enquete, etc.) — não trata como áudio.
+        send_message(phone, "Oi! 😊 Recebi seu arquivo, mas não consigo processar esse tipo por aqui. Pode me contar em texto?")
+        return
+    else:
+        print(f"Skipping type: {msg_type}")
+        return
+
+    if not text:
+        return
+
+    if is_duplicate_content(phone, text):
+        return
+
+    process_client_text(phone, text)
+
 # ─── WEBHOOK ──────────────────────────────────────────────────────────────────
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -1178,10 +1369,21 @@ def webhook():
 
         # Ignora atualizações, edições e tipos não-mensagem
         msg_type = message.get('type', '') or message.get('messageType', '')
-        if (message.get('isEdit') or message.get('updateType') or
+        # Edição de mensagem chega da UAZAPI em formatos variados (flag no topo ou
+        # um bloco 'editedMessage' aninhado no conteúdo) — em produção o bot estava
+        # respondendo de novo a mensagens editadas porque só olhava 'isEdit'.
+        edited = any(message.get(k) for k in ('isEdit', 'isEdited', 'edited', 'wasEdited'))
+        if not edited:
+            try:
+                edited = 'editedmessage' in json.dumps(message, default=str).lower()
+            except Exception:
+                edited = False
+        if (edited or message.get('updateType') or
                 msg_type in ('messageUpdate', 'editedMessage', 'protocolMessage',
                              'reactionMessage', 'reaction', 'senderKeyDistributionMessage',
                              'messageContextInfo', 'statusUpdate')):
+            if edited:
+                print(f"[SKIP] Mensagem editada ignorada (type={msg_type})")
             return jsonify({'status': 'ignored'}), 200
 
         from_me    = message.get('fromMe', False)
@@ -1205,30 +1407,54 @@ def webhook():
                 print(f"[FB_AUTO] Saudação automática ignorada")
                 return jsonify({'status': 'fb_auto_ignored'}), 200
 
-            pause_phone = get_phone_from_msg_id(message)
-            if not pause_phone:
-                chat_data   = data.get('chat', {})
-                raw         = (chat_data.get('phone', '') or chat_data.get('jid', '') or chat_data.get('chatId', '')) if isinstance(chat_data, dict) else ''
-                pause_phone = raw.replace('@s.whatsapp.net', '').replace('@c.us', '').replace('+', '') if raw else phone
+            # A UAZAPI identifica o mesmo chat ora pelo número real, ora por um id
+            # @lid — se a pausa for gravada num identificador e o fluxo do cliente
+            # consultar outro, a Evelin assume a conversa e o bot continua
+            # respondendo (visto em produção). Por isso pausamos TODOS os
+            # identificadores candidatos, não só um.
+            def _clean_jid(raw):
+                return (raw.replace('@s.whatsapp.net', '').replace('@c.us', '')
+                           .replace('@lid', '').replace('+', '').strip())
+
+            candidates = set()
+            if phone:
+                candidates.add(phone)
+            cached = get_phone_from_msg_id(message)
+            if cached:
+                candidates.add(cached)
+            chat_data = data.get('chat', {})
+            if isinstance(chat_data, dict):
+                for field in ('phone', 'jid', 'chatId', 'id', 'wa_chatid'):
+                    raw = chat_data.get(field, '')
+                    if raw and isinstance(raw, str):
+                        cleaned = _clean_jid(raw)
+                        if cleaned.isdigit():
+                            candidates.add(cleaned)
+            if not candidates:
+                candidates.add(phone)
 
             manual_text = raw_text.strip()
-            print(f"[MANUAL] Você digitou para {pause_phone}: '{manual_text[:40]}'")
+            print(f"[MANUAL] Você digitou ({'/'.join(sorted(candidates))}): '{manual_text[:40]}'")
+            print(f"[MANUAL] ids: msg_chatId='{message.get('chatId', '')}' chat={json.dumps(chat_data, default=str, ensure_ascii=False)[:200]}")
 
             # Evento fromMe vazio e sem mídia = webhook espúrio (recibo de entrega,
             # etc.), NÃO um atendimento manual — não pausa por 12h à toa.
             if not manual_text and not media_type:
-                print(f"[MANUAL] Evento vazio sem mídia ignorado ({pause_phone}).")
+                print(f"[MANUAL] Evento vazio sem mídia ignorado.")
                 return jsonify({'status': 'empty_frommme_ignored'}), 200
 
-            mark_manual_activity(pause_phone)
+            for cand in candidates:
+                mark_manual_activity(cand)
 
             if manual_text == RESUME_KEYWORD:
-                clear_pause(pause_phone)
+                for cand in candidates:
+                    clear_pause(cand)
                 return jsonify({'status': 'resumed'}), 200
 
-            set_pause(pause_phone)
+            for cand in candidates:
+                set_pause(cand)
             if manual_text:
-                append_message(pause_phone, "assistant", manual_text)
+                append_message(phone or sorted(candidates)[0], "assistant", manual_text)
             return jsonify({'status': 'paused_human_takeover'}), 200
 
         # ── Dedup ────────────────────────────────────────────────────────────
@@ -1244,147 +1470,15 @@ def webhook():
         # A reativação por "." é reservada a mensagens fromMe (ver seção 1 acima) —
         # um cliente digitando "." não deve conseguir despausar o próprio atendimento.
 
-        # ── 2) BOT PAUSADO ───────────────────────────────────────────────────
-        if is_paused(phone):
-            if text_cmd:
-                append_message(phone, "user", text_cmd)
-            print(f"⏸️  {phone} em atendimento humano.")
-            return jsonify({'status': 'paused_no_reply'}), 200
-
-        # ── 3) FLUXO NORMAL ──────────────────────────────────────────────────
-        set_followup_state(phone, {"last_client_ts": time.time(), "stage": 0})
-
-        text = ""
-
-        is_audio       = msg_type in ('audio', 'ptt', 'audioMessage', 'PTT')
-        is_media_audio = msg_type == 'media' and media_type in ('audio', 'ptt', 'ogg', 'opus', '')
-
-        if is_audio or is_media_audio:
-            raw = (
-                message.get('url') or message.get('mediaUrl') or
-                message.get('audioUrl') or message.get('content') or message.get('body')
-            )
-            if isinstance(raw, dict):
-                audio_url = raw.get('URL') or raw.get('url') or raw.get('directPath')
-                media_key = raw.get('mediaKey', '')
-                if audio_url and media_key:
-                    try:
-                        decrypt_resp = requests.post(
-                            f"{UAZAPI_URL}/media/decrypt",
-                            headers={"token": get_instance_token(), "Content-Type": "application/json"},
-                            json={"url": audio_url, "mediaKey": media_key, "type": "audio"},
-                            timeout=30
-                        )
-                        if decrypt_resp.status_code == 200:
-                            audio_url = decrypt_resp.json().get('url', audio_url)
-                    except Exception as e:
-                        print(f"Decrypt error: {e}")
-            else:
-                audio_url = raw
-
-            if audio_url:
-                text = transcribe_audio(audio_url)
-                if not text:
-                    send_message(phone, "Oi! 😊 Não consegui ouvir o áudio. Pode me mandar por texto?")
-                    return jsonify({'status': 'ok'}), 200
-            else:
-                send_message(phone, "Oi! 😊 Não consegui ouvir o áudio. Pode me mandar por texto?")
-                return jsonify({'status': 'ok'}), 200
-
-        elif msg_type in ('text', 'Conversation', 'extendedTextMessage'):
-            text = text_cmd
-
-        elif msg_type == 'media' and media_type in ('image', 'video', 'sticker', 'document'):
-            reply, alert_flag, media_flag = get_ai_response(phone, "[cliente enviou uma imagem]")
-            if reply is None:
-                notify_ai_failure(phone)
-                return jsonify({'status': 'ai_error'}), 200
-
-            if had_recent_manual_activity(phone):
-                time.sleep(PAUSE_GUARD_SECONDS)
-            if is_paused(phone):
-                print(f"⏸️ {phone} pausado durante geração da resposta — descartando resposta do bot.")
-                return jsonify({'status': 'discarded_pause_race'}), 200
-
-            send_and_check(phone, reply)
-            if alert_flag:
-                threading.Thread(target=send_alert, args=(phone, "pergunta sem resposta", "[imagem]"), daemon=True).start()
-            if media_flag:
-                threading.Thread(target=send_media_package, args=(phone,)).start()
-            return jsonify({'status': 'ok'}), 200
-        elif msg_type == 'media':
-            # Tipo de mídia não suportado (localização, contato, enquete, etc.) — não trata como áudio.
-            send_message(phone, "Oi! 😊 Recebi seu arquivo, mas não consigo processar esse tipo por aqui. Pode me contar em texto?")
-            return jsonify({'status': 'ok'}), 200
-        else:
-            print(f"Skipping type: {msg_type}")
-            return jsonify({'status': 'not_supported'}), 200
-
-        if not text:
-            return jsonify({'status': 'no_text'}), 200
-
-        if is_duplicate_content(phone, text):
-            return jsonify({'status': 'duplicate_content'}), 200
-
-        # Anti-loop de despedida: se o cliente está só trocando cortesias e o bot
-        # já respondeu uma despedida, não responde de novo (evita loop infinito).
-        if is_closing_message(text):
-            if in_closing_state(phone):
-                append_message(phone, "user", text)
-                print(f"🤝 {phone}: cortesia repetida — encerrando sem responder.")
-                return jsonify({'status': 'closing_silent'}), 200
-            set_closing_state(phone)
-        else:
-            clear_closing_state(phone)
-
-        print(f"phone='{phone}', text='{text[:80]}'")
-
-        # Detecta lead quente ANTES de chamar a IA
-        history_atual   = get_conversation(phone)
-        hot, hot_motivo = is_hot_lead(text, history_atual)
-
-        reply, alert_flag, media_flag = get_ai_response(phone, text)
-        if reply is None:
-            notify_ai_failure(phone)
-            return jsonify({'status': 'ai_error'}), 200
-
-        # Rede de segurança para mídia — não reaciona se o pacote já foi enviado nesta conversa
-        if not media_flag and not was_media_sent(phone):
-            media_keywords = ['quero ver', 'queria ver', 'pode mandar', 'manda sim',
-                              'com certeza', 'claro que sim', 'quero as fotos',
-                              'foto', 'fotos', 'video', 'vídeo', 'videos', 'vídeos']
-            history_now = get_conversation(phone)
-            last_bot    = next((m['content'] for m in reversed(history_now[:-1]) if m['role'] == 'assistant'), '')
-            if (any(kw in text.lower() for kw in media_keywords) and
-                    any(kw in last_bot.lower() for kw in ['foto', 'vídeo', 'video', 'imagens', 'mandar'])):
-                media_flag = True
-
-        # Fecha a janela de risco: se a Evelin pausou manualmente enquanto a IA gerava
-        # a resposta, descarta a resposta do bot em silêncio. Só vale a pena esperar
-        # se ela esteve ativa nesse número há pouco — senão só atrasa toda mensagem à toa.
-        if had_recent_manual_activity(phone):
-            time.sleep(PAUSE_GUARD_SECONDS)
-        if is_paused(phone):
-            print(f"⏸️ {phone} pausado durante geração da resposta — descartando resposta do bot.")
-            return jsonify({'status': 'discarded_pause_race'}), 200
-
-        send_and_check(phone, reply)
-
-        # Alertas em thread — não atrasa a resposta ao cliente
-        if alert_flag:
-            threading.Thread(target=send_alert, args=(phone, "pergunta sem resposta", text), daemon=True).start()
-        elif hot and should_send_hot_lead_alert(phone):
-            threading.Thread(target=send_hot_lead_alert, args=(phone, hot_motivo, text), daemon=True).start()
-
-        if media_flag:
-            threading.Thread(target=send_media_package, args=(phone,)).start()
-
-        # Detecta visita confirmada
-        updated_history = get_conversation(phone)
-        if is_visit_confirmed(updated_history):
-            threading.Thread(target=extract_and_save_visit, args=(phone, updated_history), daemon=True).start()
-
-        return jsonify({'status': 'ok'}), 200
+        # ── 2) PROCESSAMENTO EM BACKGROUND ───────────────────────────────────
+        # Responde o HTTP imediatamente: transcrição + IA + envio rodam em
+        # thread (ver process_incoming). Sem isso a UAZAPI estoura o timeout
+        # esperando e reentrega o webhook — era a principal fonte de respostas
+        # duplicadas em produção.
+        threading.Thread(
+            target=_process_incoming_safe, args=(data, message, phone, text_cmd), daemon=True
+        ).start()
+        return jsonify({'status': 'accepted'}), 200
 
     except Exception as e:
         print(f"Webhook error: {e}")
