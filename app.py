@@ -742,6 +742,11 @@ def _split_into_chunks(text):
 def send_and_check(phone, text):
     chunks = _split_into_chunks(text)
     for i, chunk in enumerate(chunks):
+        # Se a Evelin assumiu a conversa no meio do envio (apagou/respondeu à mão),
+        # para de mandar o restante em vez de atropelar o atendimento humano.
+        if i > 0 and is_paused(phone):
+            print(f"⏸️ {phone} assumido durante o envio — abortando as partes restantes.")
+            return False
         resp   = send_message(phone, chunk)
         status = getattr(resp, 'status_code', None) if resp is not None else None
         if status != 200:
