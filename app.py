@@ -5,6 +5,7 @@ import json
 import re
 import os
 import time
+import hashlib
 import tempfile
 import threading
 import math
@@ -268,6 +269,137 @@ def had_recent_manual_activity(phone):
     except Exception as e:
         print(f"Redis had_recent_manual_activity error ({phone}): {e}")
         return False
+
+# ─── META CONVERSIONS API — LEAD QUALIFICADO ─────────────────────────────────
+# Devolve pro Meta Ads um evento "LeadQualificado" quando o cliente confirma que
+# consegue pagar a parcela — assim a campanha pode otimizar por qualidade real,
+# não só por "conversa iniciada". Requer META_DATASET_ID e META_CAPI_TOKEN nas
+# variáveis de ambiente (Railway); sem eles o recurso fica desligado.
+META_DATASET_ID      = os.environ.get('META_DATASET_ID', '')
+META_CAPI_TOKEN      = os.environ.get('META_CAPI_TOKEN', '')
+META_API_VERSION     = os.environ.get('META_API_VERSION', 'v25.0')  # atual em jul/2026
+META_TEST_EVENT_CODE = os.environ.get('META_TEST_EVENT_CODE', '')
+CAPI_MAX_ATTEMPTS    = 8
+CAPI_STATE_TTL       = 90 * 24 * 3600
+
+_CTWA_RE = re.compile(r'"ctwa_clid"\s*:\s*"([^"]+)"')
+
+def store_ctwa_clid(phone, data):
+    """Guarda o id de clique do anúncio (ctwa_clid), que chega no webhook quando
+    a conversa nasce de um anúncio click-to-WhatsApp — é o identificador que o
+    Meta exige para eventos com action_source=business_messaging."""
+    r = get_redis()
+    if not r: return
+    try:
+        m = _CTWA_RE.search(json.dumps(data, default=str))
+        if m:
+            r.setex(f"ctwa:{phone}", CAPI_STATE_TTL, m.group(1))
+            print(f"🎯 ctwa_clid capturado para {phone}")
+    except Exception as e:
+        print(f"store_ctwa_clid error ({phone}): {e}")
+
+def _capi_send_once(item):
+    """Uma tentativa de envio. Retorna 'ok', 'retry' (falha temporária: rede,
+    5xx, rate limit) ou 'fatal' (4xx de config/payload — repetir não resolve)."""
+    try:
+        url  = f"https://graph.facebook.com/{META_API_VERSION}/{META_DATASET_ID}/events"
+        body = {"data": [item['event']]}
+        if META_TEST_EVENT_CODE:
+            body["test_event_code"] = META_TEST_EVENT_CODE
+        resp = requests.post(url, params={"access_token": META_CAPI_TOKEN}, json=body, timeout=15)
+        if resp.status_code == 200:
+            print(f"🎯 CAPI: LeadQualificado aceito ({item['event']['event_id']})")
+            return 'ok'
+        print(f"🎯 CAPI recusou ({resp.status_code}): {resp.text[:300]}")
+        return 'retry' if (resp.status_code == 429 or resp.status_code >= 500) else 'fatal'
+    except Exception as e:
+        print(f"🎯 CAPI erro de rede: {e}")
+        return 'retry'
+
+def _capi_process(item):
+    status = _capi_send_once(item)
+    if status == 'ok':
+        return
+    if status == 'fatal':
+        print(f"🎯 CAPI: falha permanente — confira dataset/token/evento no Events Manager. Evento: {json.dumps(item['event'])[:300]}")
+        for number in ALERT_NUMBERS:
+            _send_raw(number, f"⚠️ O Meta recusou o evento LeadQualificado (+{item['phone']}). Provável problema de configuração (dataset/token) — ver logs.")
+        return
+    item['attempts'] = item.get('attempts', 0) + 1
+    if item['attempts'] > CAPI_MAX_ATTEMPTS:
+        print(f"🎯 CAPI: desistindo após {CAPI_MAX_ATTEMPTS} tentativas ({item['phone']}).")
+        for number in ALERT_NUMBERS:
+            _send_raw(number, f"⚠️ Não consegui enviar o evento LeadQualificado pro Meta (+{item['phone']}) após várias tentativas — ver logs.")
+        return
+    delay = 60 * (2 ** (item['attempts'] - 1))  # 1, 2, 4, 8... minutos
+    item['next_ts'] = time.time() + delay
+    r = get_redis()
+    if r:
+        try:
+            r.rpush("capi_retry", json.dumps(item))
+            print(f"🎯 CAPI: reagendado em {delay // 60} min (tentativa {item['attempts']}).")
+            return
+        except Exception as e:
+            print(f"CAPI requeue error: {e}")
+    # Sem Redis: espera na própria thread daemon — não bloqueia o atendimento.
+    time.sleep(delay)
+    _capi_process(item)
+
+def capi_retry_sweep():
+    """Roda no scheduler: reprocessa eventos que falharam, respeitando o backoff."""
+    r = get_redis()
+    if not r: return
+    try:
+        for _ in range(r.llen("capi_retry")):
+            raw = r.lpop("capi_retry")
+            if not raw: break
+            item = json.loads(raw)
+            if item.get('next_ts', 0) > time.time():
+                r.rpush("capi_retry", raw)  # ainda não é hora — devolve pro fim da fila
+                continue
+            _capi_process(item)
+    except Exception as e:
+        print(f"capi_retry_sweep error: {e}")
+
+def queue_lead_qualified_event(phone):
+    """Dispara o evento LeadQualificado — no máximo uma vez por telefone."""
+    if not META_DATASET_ID or not META_CAPI_TOKEN:
+        print("🎯 CAPI desligada (META_DATASET_ID/META_CAPI_TOKEN ausentes) — evento não enviado.")
+        return
+    # Ids @lid não são telefone de verdade — hashear isso mandaria lixo pro matching.
+    if not (phone.startswith('55') and len(phone) in (12, 13)):
+        print(f"🎯 CAPI: '{phone}' não parece telefone BR — evento não enviado.")
+        return
+    r = get_redis()
+    if r:
+        try:
+            if not r.set(f"capi_lq:{phone}", "1", nx=True, ex=CAPI_STATE_TTL):
+                print(f"🎯 CAPI: LeadQualificado já enviado para {phone} — ignorando.")
+                return
+        except Exception as e:
+            print(f"queue_lead_qualified error ({phone}): {e}")
+    now   = int(time.time())
+    event = {
+        "event_name":    "LeadQualificado",
+        "event_time":    now,
+        "action_source": "chat",
+        "user_data":     {"ph": [hashlib.sha256(phone.encode('utf-8')).hexdigest()]},
+        "custom_data":   {"currency": "BRL", "value": 899},
+        "event_id":      f"lq_{phone}_{now}",
+    }
+    ctwa = None
+    if r:
+        try:
+            ctwa = r.get(f"ctwa:{phone}")
+        except Exception:
+            pass
+    if ctwa:
+        # Conversa nasceu de anúncio click-to-WhatsApp: o Meta pede
+        # business_messaging + o id do clique para atribuir direto à campanha.
+        event["action_source"]          = "business_messaging"
+        event["messaging_channel"]      = "whatsapp"
+        event["user_data"]["ctwa_clid"] = ctwa
+    _capi_process({"phone": phone, "event": event, "attempts": 0})
 
 # ─── ENCERRAMENTO DE CONVERSA (evita loop de despedida) ──────────────────────
 CLOSING_KEYWORDS = [
@@ -592,6 +724,17 @@ DOCUMENTAÇÃO (RGI)
 Tem RGI. A incorporadora está finalizando na prefeitura. Transferência para o nome do comprador é opcional e por conta do cliente após quitar.
 
 VISITAS: terça a domingo, qualquer horário combinado.
+
+═══════════════════════════════════════════
+MARCADOR INTERNO DE LEAD QUALIFICADO
+═══════════════════════════════════════════
+Quando o cliente confirmar CLARAMENTE que consegue pagar a entrada ou a parcela
+mensal (ex.: "consigo pagar", "cabe no meu bolso", "essa parcela dá sim",
+"fecho nessas condições", confirma que quer seguir com o financiamento),
+acrescente o marcador [LEAD_QUALIFICADO] no final da resposta. O marcador é
+interno e é removido antes do envio — o cliente nunca vê. Use no máximo UMA vez
+por conversa e SOMENTE com confirmação explícita de capacidade de pagamento —
+interesse genérico ("gostei", "quero saber mais", "me manda fotos") NÃO conta.
 """
 
 # ─── DETECÇÃO DE LEAD QUENTE ─────────────────────────────────────────────────
@@ -867,12 +1010,14 @@ def get_ai_response(phone, user_message):
         )
     except Exception as e:
         print(f"❌ ERRO NA IA para {phone}: {e}")
-        return None, False, False
+        return None, False, False, False
 
     reply_raw   = _extract_text(response)
     alert_flag  = '[ALERTA]' in reply_raw
     media_flag  = '[ENVIAR_MIDIA]' in reply_raw
-    reply_clean = reply_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
+    lq_flag     = '[LEAD_QUALIFICADO]' in reply_raw
+    reply_clean = (reply_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '')
+                            .replace('[LEAD_QUALIFICADO]', '').strip())
 
     # Auditoria/correção de empilhamento de perguntas e repetição interna
     stacked_questions  = _count_questions(reply_clean) > 1
@@ -893,11 +1038,13 @@ def get_ai_response(phone, user_message):
                 model=AI_MODEL, max_tokens=MAX_TOKENS_REPLY, system=retry_system, messages=api_messages
             )
             retry_raw   = _extract_text(retry_response)
-            retry_clean = retry_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip() if retry_raw else ""
+            retry_clean = (retry_raw.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '')
+                                    .replace('[LEAD_QUALIFICADO]', '').strip()) if retry_raw else ""
             if retry_raw and _count_questions(retry_clean) <= 1 and not _has_duplicate_paragraphs(retry_clean):
                 reply_raw   = retry_raw
                 alert_flag  = '[ALERTA]' in reply_raw
                 media_flag  = '[ENVIAR_MIDIA]' in reply_raw
+                lq_flag     = '[LEAD_QUALIFICADO]' in reply_raw
                 reply_clean = retry_clean
             else:
                 print(f"[EMPILHAMENTO] {phone}: regeneração não resolveu — mantendo original.")
@@ -907,7 +1054,7 @@ def get_ai_response(phone, user_message):
     hist_text = reply_clean + ("\n[Enviei fotos e vídeos e perguntei: O que achou?]" if media_flag else "")
     append_message(phone, "assistant", hist_text)
 
-    return reply_clean, alert_flag, media_flag
+    return reply_clean, alert_flag, media_flag, lq_flag
 
 # ─── FOLLOW-UP ───────────────────────────────────────────────────────────────
 def generate_followup(phone, stage):
@@ -929,7 +1076,8 @@ def generate_followup(phone, stage):
         ]
         response = client.messages.create(model=AI_MODEL, max_tokens=MAX_TOKENS_FOLLOWUP, system=system, messages=api_messages)
         msg      = _extract_text(response)
-        return msg.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '').strip()
+        return (msg.replace('[ALERTA]', '').replace('[ENVIAR_MIDIA]', '')
+                   .replace('[LEAD_QUALIFICADO]', '').strip())
     except Exception as e:
         print(f"generate_followup error ({phone}): {e}")
         return None
@@ -1226,7 +1374,7 @@ def handle_turn(phone, text):
     history_atual   = get_conversation(phone)
     hot, hot_motivo = is_hot_lead(text, history_atual)
 
-    reply, alert_flag, media_flag = get_ai_response(phone, text)
+    reply, alert_flag, media_flag, lq_flag = get_ai_response(phone, text)
     if reply is None:
         notify_ai_failure(phone)
         return
@@ -1262,6 +1410,10 @@ def handle_turn(phone, text):
     if media_flag:
         threading.Thread(target=send_media_package, args=(phone,)).start()
 
+    # Cliente confirmou que consegue pagar → devolve o sinal pro Meta Ads
+    if lq_flag:
+        threading.Thread(target=queue_lead_qualified_event, args=(phone,), daemon=True).start()
+
     # Detecta visita confirmada
     updated_history = get_conversation(phone)
     if is_visit_confirmed(updated_history):
@@ -1281,6 +1433,10 @@ def process_incoming(data, message, phone, text_cmd):
     estoura o timeout e REENTREGA o webhook, gerando resposta duplicada."""
     msg_type   = message.get('type', '') or message.get('messageType', '')
     media_type = message.get('mediaType', '')
+
+    # Se a conversa nasceu de anúncio click-to-WhatsApp, o webhook traz o id do
+    # clique (ctwa_clid) — guardamos para o evento de lead qualificado do Meta.
+    store_ctwa_clid(phone, data)
 
     # ── BOT PAUSADO ──────────────────────────────────────────────────────────
     if is_paused(phone):
@@ -1565,6 +1721,7 @@ if __name__ == '__main__':
     scheduler.add_job(send_recovery_message, 'interval', hours=RECOVERY_INTERVAL_HOURS)
     scheduler.add_job(followup_sweep,        'interval', minutes=FOLLOWUP_CHECK_MIN)
     scheduler.add_job(visit_reminder_sweep,  'interval', minutes=30)
+    scheduler.add_job(capi_retry_sweep,      'interval', minutes=2)
     scheduler.start()
     port = int(os.environ.get('PORT', 5000))
     # threaded=True é obrigatório: sem isso, o servidor processa um webhook por vez e o
