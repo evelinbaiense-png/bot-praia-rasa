@@ -1745,7 +1745,55 @@ def load_recovery_contacts():
     except Exception as e:
         print(f"Error loading recovery contacts: {e}")
 
+RECOVERY_DEFAULT_MSG = ("Oi {nome}! Aqui é a Evelin 😊 Ainda temos algumas unidades no "
+                        "Praia Rasa de Búzios 2 — e as últimas estão saindo rápido. "
+                        "Você ainda tem interesse?")
+
+def _recovery_first_name(raw):
+    """Primeiro nome, só se parecer nome de gente (evita emoji, empresa, código)."""
+    first = (raw or '').strip().split(' ')[0]
+    return first.title() if re.match(r'^[A-Za-zÀ-ÿ]{2,15}$', first) else ''
+
+def _recovery_render(template, name):
+    if name:
+        return template.replace('{nome}', name)
+    return template.replace(' {nome}', '').replace('{nome}', '')
+
 def send_recovery_message():
+    """Envia 1 mensagem de resgate por execução. Fonte preferida: lista no Redis
+    (upload via /recovery/form) — progresso sobrevive a restart e pula quem já
+    recebeu, quem está pausado e lead frio. Fallback: recovery.csv do repo."""
+    r = get_redis()
+    if r:
+        try:
+            raw = r.get('recovery:list')
+            if raw:
+                contacts = json.loads(raw)
+                idx      = int(r.get('recovery:idx') or 0)
+                template = r.get('recovery:msg') or RECOVERY_DEFAULT_MSG
+                while idx < len(contacts):
+                    c     = contacts[idx]
+                    idx  += 1
+                    phone = re.sub(r'\D', '', c.get('telefone', ''))
+                    if not phone:
+                        continue
+                    if r.sismember('recovery:sent', phone):
+                        continue
+                    if is_paused(phone) or is_cold_lead(phone):
+                        print(f"📨 Resgate: pulando {phone} (pausado/frio).")
+                        continue
+                    msg = c.get('mensagem') or _recovery_render(template, _recovery_first_name(c.get('nome')))
+                    send_message(phone, msg)
+                    r.sadd('recovery:sent', phone)
+                    r.set('recovery:idx', idx)
+                    print(f"📨 Resgate enviado para {phone} ({idx}/{len(contacts)}).")
+                    return
+                r.set('recovery:idx', idx)
+                return  # lista concluída
+        except Exception as e:
+            print(f"Recovery redis error: {e}")
+
+    # Fallback antigo: recovery.csv no diretório do app
     global recovery_index, recovery_contacts
     load_recovery_contacts()
     if not recovery_contacts or recovery_index >= len(recovery_contacts):
@@ -1761,7 +1809,7 @@ def send_recovery_message():
     if is_paused(phone) or is_cold_lead(phone):
         recovery_index += 1
         return
-    message = custom_msg or f"Oi{' ' + name if name else ''}! Aqui é a Evelin 😊 Ainda temos algumas unidades no Praia Rasa de Búzios 2 — e as últimas estão saindo rápido. Você ainda tem interesse?"
+    message = custom_msg or _recovery_render(RECOVERY_DEFAULT_MSG, _recovery_first_name(name))
     send_message(phone, message)
     recovery_index += 1
 
@@ -1802,6 +1850,109 @@ def pause_toggle(phone):
 def start_recovery():
     load_recovery_contacts()
     return jsonify({'status': 'ok', 'contacts': len(recovery_contacts)}), 200
+
+def _check_admin_key():
+    key       = request.args.get('key', '')
+    admin_key = os.environ.get('ADMIN_KEY', '')
+    return bool(admin_key) and key == admin_key
+
+def _recovery_status_dict():
+    r = get_redis()
+    if not r: return {'lista': 0, 'enviados': 0, 'restantes': 0}
+    try:
+        raw   = r.get('recovery:list')
+        total = len(json.loads(raw)) if raw else 0
+        sent  = r.scard('recovery:sent') or 0
+        return {'lista': total, 'enviados': int(sent), 'restantes': max(total - int(sent), 0)}
+    except Exception:
+        return {'lista': 0, 'enviados': 0, 'restantes': 0}
+
+@app.route('/recovery/form', methods=['GET'])
+def recovery_form():
+    """Página para subir a lista de resgate (CSV) e definir a mensagem padrão."""
+    if not _check_admin_key():
+        return 'Chave incorreta.', 403
+    st  = _recovery_status_dict()
+    key = request.args.get('key', '')
+    return f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Resgate de clientes — Bot Praia Rasa</title>
+<style>body{{font-family:sans-serif;max-width:640px;margin:30px auto;padding:0 16px;color:#222}}
+textarea,input[type=file]{{width:100%;box-sizing:border-box}}textarea{{height:90px;padding:8px}}
+button{{background:#1877f2;color:#fff;border:0;padding:10px 22px;border-radius:6px;font-size:15px;cursor:pointer}}
+.box{{background:#f2f4f7;border-radius:8px;padding:12px 16px;margin:14px 0}}</style></head><body>
+<h2>📨 Resgate de clientes antigos</h2>
+<div class="box">Lista atual: <b>{st['lista']}</b> contatos — enviados: <b>{st['enviados']}</b> — restantes: <b>{st['restantes']}</b><br>
+Ritmo: 1 mensagem a cada {RECOVERY_INTERVAL_HOURS:g}h (pula pausados, leads frios e quem já recebeu).</div>
+<form method="post" enctype="multipart/form-data" action="/recovery/upload?key={key}">
+<p><b>1. Planilha CSV</b> (colunas: telefone, nome — as demais são opcionais):<br><input type="file" name="arquivo" accept=".csv" required></p>
+<p><b>2. Mensagem padrão</b> (use {{nome}} onde o primeiro nome deve entrar):<br>
+<textarea name="mensagem">{RECOVERY_DEFAULT_MSG}</textarea></p>
+<p><button type="submit">Carregar lista e iniciar resgate</button></p>
+</form>
+<p><a href="/recovery/stop?key={key}" onclick="return confirm('Parar e apagar a lista de resgate?')">🛑 Parar o resgate (apaga a lista)</a></p>
+</body></html>"""
+
+@app.route('/recovery/upload', methods=['POST'])
+def recovery_upload():
+    if not _check_admin_key():
+        return 'Chave incorreta.', 403
+    r = get_redis()
+    if not r:
+        return 'Redis indisponível — não dá para armazenar a lista.', 503
+    f = request.files.get('arquivo')
+    if not f:
+        return 'Nenhum arquivo enviado.', 400
+    try:
+        text = f.read().decode('utf-8-sig', errors='replace')
+    except Exception as e:
+        return f'Não consegui ler o arquivo: {e}', 400
+    if not text.strip():
+        return 'O arquivo está vazio.', 400
+    # Excel em português costuma salvar CSV com ponto e vírgula
+    header = text.splitlines()[0]
+    delim  = ';' if header.count(';') > header.count(',') else ','
+    import io
+    reader   = csv.DictReader(io.StringIO(text), delimiter=delim)
+    contacts, seen = [], set()
+    for row in reader:
+        row   = { (k or '').strip().lower(): (v or '').strip() for k, v in row.items() }
+        phone = re.sub(r'\D', '', row.get('telefone', ''))
+        if not phone.startswith('55') or len(phone) not in (12, 13) or phone in seen:
+            continue
+        seen.add(phone)
+        contacts.append({'telefone': phone, 'nome': row.get('nome', ''), 'mensagem': row.get('mensagem', '')})
+    if not contacts:
+        return 'Nenhum telefone válido encontrado no arquivo (esperado coluna "telefone" com números 55DDD9XXXXXXXX).', 400
+    template = (request.form.get('mensagem') or '').strip() or RECOVERY_DEFAULT_MSG
+    r.set('recovery:list', json.dumps(contacts))
+    r.set('recovery:msg', template)
+    r.set('recovery:idx', 0)
+    r.delete('recovery:sent')
+    dias_estimados = math.ceil(len(contacts) * RECOVERY_INTERVAL_HOURS / 24)
+    print(f"📨 Resgate: lista carregada com {len(contacts)} contatos.")
+    return (f'✅ Lista carregada: {len(contacts)} contatos. O bot enviará 1 mensagem a cada '
+            f'{RECOVERY_INTERVAL_HOURS:g}h (~{dias_estimados} dias para concluir). '
+            f'Acompanhe em /recovery/status?key=SUACHAVE'), 200
+
+@app.route('/recovery/status', methods=['GET'])
+def recovery_status():
+    if not _check_admin_key():
+        return 'Chave incorreta.', 403
+    return jsonify(_recovery_status_dict()), 200
+
+@app.route('/recovery/stop', methods=['GET'])
+def recovery_stop():
+    if not _check_admin_key():
+        return 'Chave incorreta.', 403
+    r = get_redis()
+    if r:
+        try:
+            r.delete('recovery:list', 'recovery:idx', 'recovery:msg')
+            print("🛑 Resgate interrompido — lista apagada (histórico de enviados mantido).")
+        except Exception as e:
+            return f'Erro: {e}', 500
+    return '🛑 Resgate parado e lista apagada. Quem já recebeu não receberá de novo se você subir outra lista.', 200
 
 @app.route('/export/chats', methods=['GET'])
 def export_chats():
