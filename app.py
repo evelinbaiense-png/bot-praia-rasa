@@ -449,6 +449,53 @@ def clear_closing_state(phone):
     except Exception:
         pass
 
+# ─── LEAD FRIO (cliente recusou — parar de insistir) ─────────────────────────
+# Cliente que disse "não" continua sendo RESPONDIDO se escrever, mas o bot para
+# de puxar assunto: sem follow-up, sem resgate, por 30 dias. Em produção o bot
+# insistiu por dias depois de um "não estou interessado" e foi bloqueado.
+COLD_LEAD_TTL = 30 * 24 * 3600
+
+REJECTION_SIGNALS = [
+    'não estou interessado', 'nao estou interessado',
+    'não estou interessada', 'nao estou interessada',
+    'não tenho interesse', 'nao tenho interesse', 'sem interesse',
+    'não quero', 'nao quero', 'no momento não', 'no momento nao',
+    'não vou comprar', 'nao vou comprar', 'já comprei', 'ja comprei',
+    'desisti', 'para de mandar', 'pare de mandar',
+    'não manda mais', 'nao manda mais', 'me tira da lista',
+    'não me chame', 'nao me chame', 'não insista', 'nao insista',
+]
+
+def is_rejection_message(text):
+    t = (text or '').lower()
+    return any(s in t for s in REJECTION_SIGNALS)
+
+def set_cold_lead(phone):
+    r = get_redis()
+    if not r: return
+    try:
+        r.setex(f"cold:{phone}", COLD_LEAD_TTL, "1")
+        print(f"🧊 {phone} marcado como lead frio (recusou) — follow-ups suspensos por 30 dias.")
+    except Exception as e:
+        print(f"Redis set_cold_lead error ({phone}): {e}")
+
+def clear_cold_lead(phone):
+    r = get_redis()
+    if not r: return
+    try:
+        if r.delete(f"cold:{phone}"):
+            print(f"🔥 {phone} reengajou — lead frio removido.")
+    except Exception:
+        pass
+
+def is_cold_lead(phone):
+    r = get_redis()
+    if not r: return False
+    try:
+        return r.exists(f"cold:{phone}") == 1
+    except Exception:
+        return False
+
 # ─── MÍDIAS ──────────────────────────────────────────────────────────────────
 PHOTOS = [
     "https://res.cloudinary.com/dd6o3z4ma/image/upload/v1783794693/foto-01-pergola_kcvsxw.jpg",
@@ -517,30 +564,33 @@ QUANDO NÃO SOUBER O PERFIL: siga o fluxo normal e vá adaptando conforme ele fa
 ═══════════════════════════════════════════
 PRIMEIRA MENSAGEM DO CLIENTE (vinda do anúncio)
 ═══════════════════════════════════════════
-Se a primeira mensagem for "Olá! Gostaria de saber valores e disponibilidade":
-- É intenção real — o cliente clicou no anúncio
-- Responda com simpatia e qualifique rapidamente: "Oi! Que ótimo 😊 Me conta uma coisa: você está pensando em morar, ter uma casa de veraneio ou é mais como investimento?"
-- NÃO mande mídia ainda — qualifique primeiro
+Se a primeira mensagem for "Olá! Gostaria de saber valores e disponibilidade" (ou parecida):
+- É intenção real — o cliente clicou no anúncio pedindo valores. NÃO responda com pergunta de qualificação.
+- Responda curto, anuncie a mídia e JÁ MANDE:
+  "Oi! Que ótimo 😊 Deixa eu já te mostrar o empreendimento — vou te mandar uns vídeos e fotos!" + [ENVIAR_MIDIA]
+- O fecho da mídia já pergunta se pode passar os valores. Siga a conversa a partir da resposta do cliente.
+- A pergunta morar/veraneio/investimento fica para DEPOIS (ver PASSO 3) — NUNCA como primeira mensagem.
 
 ═══════════════════════════════════════════
 SEU FLUXO NATURAL
 ═══════════════════════════════════════════
 Siga essa ordem quando o cliente deixar você conduzir. Se ele puxar outro assunto, acompanhe — responda e depois retome.
 
-PASSO 1 — Objetivo:
-"Você está pensando em morar, ter uma casa de veraneio ou investir?"
-
-PASSO 2 — Mídia (sempre, após entender o objetivo):
+PASSO 1 — Mídia (logo no início, anunciando):
 "Deixa eu já te mostrar o empreendimento!" + [ENVIAR_MIDIA]
+(O fecho da mídia já pergunta se pode passar os valores.)
 
-PASSO 3 — Localização (se ele não perguntou antes):
+PASSO 2 — Valores (assim que o cliente autorizar ou pedir):
+apresente 300m² e 600m² com PARCELAS.
+⚠️ NUNCA mencione valor à vista por iniciativa. Só se perguntarem.
+
+PASSO 3 — Objetivo (morar, veraneio ou investimento):
+pergunte DEPOIS da mídia/valores, quando for útil para indicar o tamanho
+ideal (300 ou 600m²). NUNCA como abertura da conversa.
+
+PASSO 4 — Localização (se ele não perguntou antes):
 "Posso te mandar a localização?"
 Se sim: https://www.google.com/maps/@-22.7238716,-42.001362,493m
-
-PASSO 4 — Valores (se ele não perguntou antes):
-"Posso te passar os valores?"
-Se sim: apresente 300m² e 600m² com PARCELAS.
-⚠️ NUNCA mencione valor à vista por iniciativa. Só se perguntarem.
 
 PASSO 5 — Visita: seu objetivo final é levar o cliente a agendar uma visita, mas
 NÃO pergunte sobre visita em toda mensagem. Só traga o assunto quando o cliente
@@ -648,6 +698,35 @@ COMO CONVERSAR
   o cliente a responder. Ex.: "Obrigada, [nome]! Qualquer coisa estou por
   aqui 😊" e pare. NUNCA fique devolvendo cortesia infinitamente — se o
   cliente responder outra cortesia, não precisa responder de novo.
+
+═══════════════════════════════════════════
+NOME DO CLIENTE — REGRA ABSOLUTA
+═══════════════════════════════════════════
+- NUNCA chame o cliente por um nome que ele NÃO disse NESTA conversa.
+  Não deduza, não invente, não adivinhe. Se você não sabe o nome, fale de
+  forma neutra ("você", "o senhor", "a senhora").
+- Já aconteceu de inventar um nome errado e o cliente reclamar — isso
+  queima a venda. Antes de usar qualquer nome, confirme no histórico que
+  foi O CLIENTE quem o informou.
+- Pergunte o nome apenas UMA vez e só quando for natural — de preferência
+  na hora de agendar a visita ("Pra eu deixar tudo certinho, qual o seu
+  nome?").
+- Se errou o nome e o cliente corrigiu: peça desculpas UMA vez e nunca
+  mais use o nome errado.
+
+═══════════════════════════════════════════
+QUANDO O CLIENTE RECUSAR — ACEITE O NÃO
+═══════════════════════════════════════════
+Se o cliente disser claramente que não tem interesse, que não quer agora,
+"no momento não", "já comprei em outro lugar" ou pedir para parar:
+- Responda UMA única mensagem curta e elegante, deixando a porta aberta
+  ("Sem problemas! Se um dia fizer sentido, é só me chamar 😊"), e ENCERRE.
+- NUNCA rebata com novo argumento de venda ("mas o parcelamento sai mais
+  leve...", "que tal dar uma olhada..."), NUNCA reformule a oferta, NUNCA
+  pergunte o motivo da recusa.
+- Depois desse fechamento, não puxe mais assunto — nem "boa semana", nem
+  "passando pra lembrar". Insistência depois do não já fez cliente
+  bloquear o número.
 
 ═══════════════════════════════════════════
 QUANDO NÃO SOUBER RESPONDER
@@ -875,7 +954,7 @@ def send_media_package(phone):
             send_image(phone, photo_url)
             time.sleep(1)
         time.sleep(2)
-        send_message(phone, "O que achou? 😊")
+        send_message(phone, "O que achou? Posso te passar os valores? 😊")
         mark_media_sent(phone)
         print(f"Media package complete for {phone}")
     except Exception as e:
@@ -1051,7 +1130,7 @@ def get_ai_response(phone, user_message):
         except Exception as e:
             print(f"[EMPILHAMENTO] {phone}: erro ao regenerar: {e}")
 
-    hist_text = reply_clean + ("\n[Enviei fotos e vídeos e perguntei: O que achou?]" if media_flag else "")
+    hist_text = reply_clean + ("\n[Enviei fotos e vídeos e perguntei: O que achou? Posso te passar os valores?]" if media_flag else "")
     append_message(phone, "assistant", hist_text)
 
     return reply_clean, alert_flag, media_flag, lq_flag
@@ -1284,6 +1363,7 @@ def followup_sweep():
             phone = key.split("fu:", 1)[1]
             if is_paused(phone): continue
             if in_closing_state(phone): continue  # cliente já se despediu — não perturbar
+            if is_cold_lead(phone): continue      # cliente recusou — não insistir
             state = get_followup_state(phone)
             if not state: continue
             stage = state.get("stage", 0)
@@ -1373,6 +1453,15 @@ def handle_turn(phone, text):
     # Detecta lead quente ANTES de chamar a IA
     history_atual   = get_conversation(phone)
     hot, hot_motivo = is_hot_lead(text, history_atual)
+
+    # Cliente recusou claramente → lead frio: o bot ainda responde (despedida
+    # elegante, ver prompt), mas follow-ups e resgates param por 30 dias.
+    # Se um lead frio voltar por conta própria com pergunta ou sinal de compra,
+    # reaquece.
+    if is_rejection_message(text):
+        set_cold_lead(phone)
+    elif (hot or '?' in text) and is_cold_lead(phone):
+        clear_cold_lead(phone)
 
     reply, alert_flag, media_flag, lq_flag = get_ai_response(phone, text)
     if reply is None:
@@ -1669,7 +1758,7 @@ def send_recovery_message():
     if not phone:
         recovery_index += 1
         return
-    if is_paused(phone):
+    if is_paused(phone) or is_cold_lead(phone):
         recovery_index += 1
         return
     message = custom_msg or f"Oi{' ' + name if name else ''}! Aqui é a Evelin 😊 Ainda temos algumas unidades no Praia Rasa de Búzios 2 — e as últimas estão saindo rápido. Você ainda tem interesse?"
