@@ -1763,6 +1763,14 @@ def send_recovery_message():
     """Envia 1 mensagem de resgate por execução. Fonte preferida: lista no Redis
     (upload via /recovery/form) — progresso sobrevive a restart e pula quem já
     recebeu, quem está pausado e lead frio. Fallback: recovery.csv do repo."""
+    # Só em horário comercial: mensagem de madrugada parece robô e gera denúncia.
+    try:
+        import pytz
+        hora = datetime.now(pytz.timezone("America/Sao_Paulo")).hour
+        if not (8 <= hora < 20):
+            return
+    except Exception:
+        pass
     r = get_redis()
     if r:
         try:
