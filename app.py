@@ -1803,6 +1803,78 @@ def start_recovery():
     load_recovery_contacts()
     return jsonify({'status': 'ok', 'contacts': len(recovery_contacts)}), 200
 
+@app.route('/export/chats', methods=['GET'])
+def export_chats():
+    """Exporta todos os números que já conversaram com o bot (via UAZAPI
+    /chat/find) em CSV pronto para virar recovery.csv. Uso:
+    /export/chats?key=ADMIN_KEY&dias=30  → só conversas paradas há 30+ dias."""
+    key       = request.args.get('key', '')
+    admin_key = os.environ.get('ADMIN_KEY', '')
+    if not admin_key or key != admin_key:
+        return 'Chave incorreta.', 403
+    try:
+        dias = int(request.args.get('dias', '0'))
+    except ValueError:
+        dias = 0
+    cutoff = time.time() - dias * 86400 if dias > 0 else None
+
+    headers = {"token": get_instance_token(), "Content-Type": "application/json"}
+    rows, offset = [], 0
+    while offset < 5000:  # teto de segurança
+        body = {"operator": "AND", "wa_isGroup": False,
+                "sort": "-wa_lastMsgTimestamp", "limit": 500, "offset": offset}
+        try:
+            resp = requests.post(f"{UAZAPI_URL}/chat/find", headers=headers, json=body, timeout=30)
+        except Exception as e:
+            return f"Erro ao consultar a UAZAPI: {e}", 502
+        if resp.status_code != 200:
+            return f"UAZAPI recusou ({resp.status_code}): {resp.text[:300]}", 502
+        data  = resp.json()
+        chats = data.get('chats') or data.get('items') or (data if isinstance(data, list) else [])
+        if not chats:
+            break
+        for c in chats:
+            chatid = str(c.get('wa_chatid', '') or c.get('wa_fastid', ''))
+            if '@g.us' in chatid or 'broadcast' in chatid:
+                continue  # grupos e listas de transmissão ficam de fora
+            phone = (chatid.replace('@s.whatsapp.net', '').replace('@c.us', '')
+                           .replace('@lid', '').strip())
+            if not phone.isdigit() or phone in ALERT_NUMBERS:
+                continue
+            nome = (c.get('wa_contactName') or c.get('wa_name') or c.get('name') or '').strip()
+            ts   = c.get('wa_lastMsgTimestamp') or 0
+            try:
+                ts   = int(ts)
+                ts_s = ts / 1000 if ts > 10**12 else ts
+            except Exception:
+                ts_s = 0
+            if cutoff and ts_s > cutoff:
+                continue  # conversa recente demais — não é lead "antigo"
+            data_str = datetime.fromtimestamp(ts_s).strftime('%d/%m/%Y') if ts_s else ''
+            rows.append((phone, nome, data_str))
+        if len(chats) < 500:
+            break
+        offset += 500
+
+    seen, uniq = set(), []
+    for r in rows:
+        if r[0] in seen:
+            continue
+        seen.add(r[0])
+        uniq.append(r)
+
+    import io
+    buf = io.StringIO()
+    w   = csv.writer(buf)
+    w.writerow(['telefone', 'nome', 'ultima_conversa', 'mensagem', 'sent'])
+    for phone, nome, data_str in uniq:
+        w.writerow([phone, nome, data_str, '', ''])
+    print(f"📇 Export de chats: {len(uniq)} contatos (dias={dias}).")
+    return app.response_class(
+        buf.getvalue(), mimetype='text/csv; charset=utf-8',
+        headers={'Content-Disposition': 'attachment; filename=contatos_bot.csv'}
+    )
+
 # ─── INICIALIZAÇÃO ────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     get_redis()
